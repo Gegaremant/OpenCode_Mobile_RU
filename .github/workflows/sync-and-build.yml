@@ -127,6 +127,18 @@ jobs:
         working-directory: original-src
         run: npx expo prebuild --platform android --no-install
 
+      - name: Strip Sentry native upload
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: |
+          # No Sentry credentials in this fork, so the SentryUpload gradle task
+          # would fail the release build. Remove the gradle hook after prebuild
+          # (prebuild regenerates the android/ tree).
+          sed -i '/apply from.*sentry.gradle/d' android/app/build.gradle
+          grep -q "sentry.gradle" android/app/build.gradle && { echo "ERROR: sentry.gradle still present"; exit 1; } || true
+          echo "Sentry gradle hook removed"
+
+
       - name: Setup signing
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src
