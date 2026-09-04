@@ -175,15 +175,6 @@ jobs:
           name: opencode-mobile-ru-${{ steps.version.outputs.version }}
           path: original-src/android/app/build/outputs/apk/release/app-release.apk
 
-      - name: Push source changes to self repo
-        if: steps.check_sync.outputs.already_synced == 'false'
-        working-directory: original-src
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add self "https://x-access-token:${{ secrets.GIT_TOKEN }}@github.com/${{ env.SELF_REPO }}.git"
-          git push self HEAD:main --force
-
       - name: Create release in self repo
         if: steps.check_sync.outputs.already_synced == 'false'
         uses: softprops/action-gh-release@v2
