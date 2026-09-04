@@ -1,0 +1,456 @@
+{
+  "common": {
+    "cancel": "Отмена",
+    "ok": "ОК",
+    "error": "Ошибка",
+    "delete": "Удалить",
+    "retry": "Повторить",
+    "save": "Сохранить",
+    "shareReport": "Поделиться отчётом"
+  },
+  "settings": {
+    "sections": {
+      "security": "Безопасность",
+      "notifications": "Уведомления",
+      "privacy": "Конфиденциальность",
+      "about": "О приложении"
+    },
+    "security": {
+      "biometricOpen": {
+        "label": "Требовать биометрию для открытия",
+        "descriptionEnabled": "Использовать Face ID или Touch ID для разблокировки",
+        "descriptionUnavailable": "Биометрическая аутентификация недоступна"
+      },
+      "biometricSend": {
+        "label": "Требовать биометрию для отправки",
+        "description": "Аутентификация перед отправкой сообщений"
+      },
+      "lockNow": {
+        "label": "Заблокировать приложение",
+        "description": "Требовать аутентификацию для повторного открытия"
+      }
+    },
+    "notifications": {
+      "disabledNotice": "Уведомления отключены на уровне системы. Включите их в настройках, чтобы получать оповещения."
+    },
+    "privacy": {
+      "crashReporting": {
+        "label": "Отчёты об ошибках и аналитика",
+        "description": "Поделяться анонимными отчётами об ошибках (Sentry) и аналитикой использования (PostHog) для улучшения OpenCode. Диагностические отчёты также направляются в нашу службу поддержки. Код и промпты не включаются."
+      },
+      "privacyPolicy": {
+        "label": "Политика конфиденциальности",
+        "description": "Какие данные мы собираем и как"
+      }
+    },
+    "about": {
+      "version": "Версия",
+      "github": {
+        "label": "GitHub",
+        "description": "Посмотреть исходный код"
+      },
+      "docs": {
+        "label": "Документация",
+        "description": "Узнать, как пользоваться OpenCode"
+      }
+    },
+    "language": {
+      "label": "Язык",
+      "title": "Выберите язык",
+      "system": "Системный по умолчанию",
+      "en": "English",
+      "zhHans": "Упрощённый китайский",
+      "ru": "Русский"
+    },
+    "footer": {
+      "appName": "OpenCode Mobile",
+      "tagline": "Подключайтесь к AI-ассистенту из любой точки"
+    },
+    "alerts": {
+      "privacyNotSavedTitle": "Настройка конфиденциальности не сохранена",
+      "privacyNotSavedMessage": "Отчётность об ошибках отключена на этой сессии, но ваш выбор не удалось сохранить. Пожалуйста, попробуйте снова.",
+      "notificationsDisabledTitle": "Уведомления отключены",
+      "notificationsDisabledMessage": "Включите уведомления для OpenCode в настройках устройства, чтобы получать оповещения."
+    }
+  },
+  "session": {
+    "titleFallback": "Сессия",
+    "toolbar": {
+      "auto": "Авто"
+    },
+    "banners": {
+      "reconnecting": "Переподключение… (попытка {{attempt}})",
+      "connected": "Подключено ✓",
+      "reverted": "Сообщение отменено — отправьте повторно для подтверждения",
+      "undo": "Отменить"
+    },
+    "empty": {
+      "title": "Начните разговор",
+      "hint": "Введите / для команд"
+    },
+    "loadingOlder": "Загрузка более ранних сообщений...",
+    "input": {
+      "placeholderListening": "Слушаю...",
+      "placeholderFollowUp": "Отправить уточнение...",
+      "placeholderDefault": "Введите сообщение..."
+    },
+    "actions": {
+      "editMessage": "Редактировать сообщение",
+      "replace": "Заменить"
+    },
+    "alerts": {
+      "messageActionsTitle": "Действия с сообщением",
+      "notSupportedTitle": "Не поддерживается",
+      "notSupportedMessage": "Редактирование отправленных сообщений требует более новой версии сервера opencode. Обновите сервер и попробуйте снова.",
+      "revertAuthFailedTitle": "Ошибка аутентификации",
+      "revertAuthFailedMessage": "Ваши учётные данные сервера отклонены. Проверьте подключение и попробуйте снова.",
+      "editFailedTitle": "Ошибка редактирования",
+      "editFailedMessage": "Не удалось отменить до этого сообщения. Пожалуйста, попробуйте снова.",
+      "replaceDraftTitle": "Заменить черновик?",
+      "replaceDraftMessage": "У вас есть неотправленное сообщение в редакторе. Редактирование этого сообщения заменит его.",
+      "cameraPermissionTitle": "Требуется разрешение",
+      "cameraPermissionMessage": "Для съёмки необходим доступ к камере.",
+      "emptyClipboardTitle": "Буфер обмена пуст",
+      "emptyClipboardMessage": "Буфер обмена не содержит текста или изображения.",
+      "authRequiredTitle": "Требуется аутентификация",
+      "authRequiredMessage": "Для отправки необходима биометрическая аутентификация. Пожалуйста, попробуйте снова.",
+      "sendFailedTitle": "Сообщение не отправлено",
+      "sendFailedMessage": "Не удалось отправить сообщение. Проверьте подключение и попробуйте снова.",
+      "replyFailedTitle": "Ошибка ответа",
+      "replyFailedMessage": "Не удалось отправить ответ. Пожалуйста, попробуйте снова.",
+      "rejectFailedTitle": "Ошибка отклонения",
+      "rejectFailedMessage": "Не удалось отправить ответ. Пожалуйста, попробуйте снова.",
+      "imageFailedTitle": "Изображение не прикреплено",
+      "imageFailedMessage": "Не удалось обработать одно или несколько изображений. Попробуйте другое фото.",
+      "speechErrorTitle": "Ошибка голосового ввода",
+      "speechErrorMessage": "Не удалось использовать голосовой ввод. Проверьте разрешение на микрофон и попробуйте снова."
+    }
+  },
+  "connection": {
+    "shared": {
+      "connectionType": "Тип подключения",
+      "types": {
+        "local": "Локальное",
+        "tunnel": "Туннель",
+        "cloud": "Облачное"
+      },
+      "name": "Название",
+      "namePlaceholder": "Мой сервер",
+      "serverUrl": "URL сервера",
+      "directoryOptional": "Каталог проекта (необязательно)",
+      "authentication": "Аутентификация",
+      "username": "Имя пользователя",
+      "password": "Пароль",
+      "alerts": {
+        "enterName": "Пожалуйста, введите название подключения",
+        "enterUrl": "Пожалуйста, введите URL сервера",
+        "invalidUrlTitle": "Неверный URL",
+        "invalidUrlMessage": "Введите полный URL, включая http:// или https://, например http://192.168.1.100:4096",
+        "connectionFailedTitle": "Ошибка подключения",
+        "unknownError": "Неизвестная ошибка",
+        "saveFailedTitle": "Не удалось сохранить подключение",
+        "saveFailedMessage": "Тест подключения прошёл успешно, но сохранение не удалось. Пожалуйста, попробуйте снова."
+      }
+    },
+    "add": {
+      "quick": {
+        "title": "Подключение к OpenCode",
+        "subtitle": "Введите IP-адрес вашего компьютера для подключения",
+        "ipAddressLabel": "IP-адрес",
+        "nameOptionalLabel": "Название (необязательно)",
+        "namePlaceholder": "Мой Mac",
+        "passwordIfSetLabel": "Пароль (если установлен на сервере)",
+        "passwordPlaceholder": "Оставьте пустым, если нет",
+        "usernameHintPrefix": "Имя пользователя по умолчанию — ",
+        "usernameHintMiddle": ". Пользовательское имя? Используйте ",
+        "usernameHintSuffix": ".",
+        "advancedOptionsLink": "Дополнительные параметры",
+        "connectButton": "Подключить",
+        "helpTitle": "Как найти IP:",
+        "helpMacPrefix": "На Mac выполните:",
+        "helpTailscalePrefix": "Примеры Tailscale:",
+        "helpProtocolPrefix": "Используйте ",
+        "helpProtocolMiddle": " для локальных и Tailscale-адресов, если не настроен TLS, тогда используйте ",
+        "helpProtocolSuffix": ".",
+        "helpRunningPrefix": "Убедитесь, что OpenCode запущен:",
+        "connectCardTitle": "OpenCode Connect",
+        "connectCardBadge": "Скоро",
+        "connectCardDesc": "Свяжите телефон с сервером opencode — без настройки туннеля, без конфигурации防火walls. Подключение в одно касание из любой точки.",
+        "advancedLink": "Дополнительные параметры (туннели, облако, аутентификация)"
+      },
+      "waitlist": {
+        "successText": "Вы в списке — мы напишем вам, когда OpenCode Connect будет готов.",
+        "joinButton": "Вступить в лист ожидания",
+        "alertTitle": "Вступить в лист ожидания",
+        "queuedText": "Сохранено на этом устройстве — мы завершим регистрацию, как только вы снова будете онлайн. Вам ничего не нужно делать.",
+        "emailUsLink": "Всё ещё не работает? Напишите нам",
+        "emailUsButton": "Написать нам",
+        "queueFailedMessage": "Не удалось связаться с сервисом регистрации или сохранить ваш запрос на этом устройстве. Вы можете написать нам, и мы добавим вас вручную.",
+        "noMailAppMessage": "Приложение почты недоступно. Пожалуйста, напишите на support@agentlabs.cc с темой \"OpenCode Connect Waitlist\"."
+      },
+      "advanced": {
+        "backToQuick": "Простой режим",
+        "urlHintPrefix": "Примеры локальных/Tailscale: ",
+        "urlHintOr": " или ",
+        "urlHintUse": ". Используйте ",
+        "urlHintSuffix": " только при настроенном TLS.",
+        "directoryHint": "Оставьте пустым для использования текущей директории сервера, или укажите путь для работы в другой папке.",
+        "saveButton": "Сохранить подключение"
+      },
+      "alerts": {
+        "enterIp": "Пожалуйста, введите IP-адрес вашего компьютера",
+        "connectionFailedMessage": "{{summary}}\n\nЦель: {{target}}\nОшибка: {{error}}"
+      }
+    },
+    "edit": {
+      "notFound": "Подключение не найдено",
+      "directoryHint": "Оставьте пустым для использования текущей директории сервера. Сессии будут создаваться в этой папке.",
+      "passwordLabel": "Пароль (оставьте пустым для сохранения текущего)",
+      "testButton": "Проверить подключение",
+      "saveButton": "Сохранить изменения",
+      "deleteButton": "Удалить подключение",
+      "alerts": {
+        "successTitle": "Успех",
+        "successMessage": "Подключение успешно!",
+        "connectionFailedMessage": "{{summary}}\n\n({{detail}})",
+        "noDetail": "нет подробностей",
+        "deleteTitle": "Удалить подключение",
+        "deleteMessage": "Вы уверены, что хотите удалить \"{{name}}\"?"
+      }
+    }
+  },
+  "nav": {
+    "sessionsTab": "Сессии",
+    "connectionsTab": "Подключения",
+    "settingsTab": "Настройки",
+    "addConnectionTitle": "Добавить подключение",
+    "editConnectionTitle": "Редактировать подключение"
+  },
+  "connectionsList": {
+    "activeBadge": "Активно",
+    "lastConnected": "Последнее подключение: {{date}}",
+    "actionsAlert": {
+      "message": "Что вы хотите сделать?",
+      "edit": "Редактировать"
+    },
+    "empty": {
+      "title": "Нет подключений",
+      "subtitle": "Добавьте подключение к вашему серверу OpenCode"
+    },
+    "header": "Нажмите для переключения, долгое нажатие для параметров",
+    "preferences": {
+      "title": "Настройки",
+      "pageSizeLabel": "Сообщений на страницу",
+      "pageSizeHint": "Сколько сообщений загружать при открытии сессии. Меньше = быстрее."
+    }
+  },
+  "sessionsList": {
+    "untitledSession": "Без названия",
+    "time": {
+      "justNow": "Только что",
+      "minutesAgo": "{{count}} мин. назад",
+      "hoursAgo": "{{count}} ч. назад",
+      "daysAgo": "{{count}} дн. назад"
+    },
+    "filesCount": "{{count}} файлов",
+    "actions": {
+      "rename": "Переименовать"
+    },
+    "alerts": {
+      "renameFailedTitle": "Ошибка переименования",
+      "renameFailedMessage": "Не удалось переименовать сессию. Пожалуйста, попробуйте снова.",
+      "deleteTitle": "Удалить сессию",
+      "deleteMessage": "Удалить \"{{title}}\"?",
+      "deleteFailedTitle": "Ошибка удаления",
+      "deleteFailedMessage": "Не удалось удалить сессию. Пожалуйста, попробуйте снова.",
+      "createFailedMessage": "Не удалось создать сессию. Проверьте подключение и попробуйте снова."
+    },
+    "empty": {
+      "noConnectionTitle": "Нет подключения",
+      "noConnectionSubtitle": "Подключитесь к компьютеру с opencode serve в вашей сети или через Tailscale.",
+      "setupGuideLink": "Как настроить сервер",
+      "addConnectionButton": "Добавить подключение",
+      "tryDemoButton": "Попробовать демо (без сервера)",
+      "authFailedTitle": "Ошибка аутентификации",
+      "authFailedSubtitle": "{{name}} отклонил ваши учётные данные. Проверьте имя пользователя и пароль для повторного подключения.",
+      "checkCredentialsButton": "Проверить учётные данные",
+      "noSessions": "Сессий пока нет"
+    },
+    "newSessionModal": {
+      "title": "Новая сессия",
+      "currentProjectLabel": "Текущий проект",
+      "serverDefault": "По умолчанию на сервере",
+      "recentProjectsLabel": "Недавние проекты",
+      "serverProjectsLabel": "Проекты сервера",
+      "browseFoldersLabel": "Обзор папок…",
+      "browseFoldersHint": "Просмотр файловой системы сервера",
+      "enterPathLabel": "Введите путь вручную",
+      "createInButton": "Создать в {{dir}}",
+      "createSessionButton": "Создать сессию"
+    },
+    "renameModal": {
+      "title": "Переименовать сессию"
+    }
+  },
+  "notifications": {
+    "categories": {
+      "permissions": {
+        "label": "Запросы разрешений",
+        "description": "Когда инструменту нужно одобрение для продолжения"
+      },
+      "questions": {
+        "label": "Вопросы",
+        "description": "Когда ассистенту нужен ваш ответ"
+      },
+      "completed": {
+        "label": "Задача выполнена",
+        "description": "Когда сессия завершила обработку"
+      },
+      "errors": {
+        "label": "Ошибки",
+        "description": "Когда сессия столкнулась с проблемой"
+      },
+      "connection": {
+        "label": "Подключение",
+        "description": "Когда приложение теряет подключение на длительное время"
+      }
+    }
+  },
+  "errorBoundary": {
+    "title": "Что-то пошло не так",
+    "subtitle": "Приложение столкнулось с непредвиденной ошибкой. Она была автоматически отправлена. Вы можете поделиться подробным отчётом, чтобы помочь нам исправить быстрее.",
+    "errorLabel": "Ошибка",
+    "unknownError": "Неизвестная ошибка",
+    "stackLabel": "Стек",
+    "componentLabel": "Компонент",
+    "shareButton": "Поделиться отчётом",
+    "tryAgainButton": "Попробовать снова"
+  },
+  "telemetryConsent": {
+    "title": "Помочь улучшить OpenCode?",
+    "body": "Поделяться анонимными отчётами об ошибках и аналитикой использования, чтобы помочь нам находить и исправлять ошибки быстрее. Диагностические отчёты также направляются в нашу службу поддержки. Код, промпты и адреса серверов никогда не включаются.",
+    "bullets": {
+      "deviceInfo": "Модель устройства, версия ОС, версия приложения",
+      "stackTraces": "Стеки ошибок (без значений переменных)",
+      "usageEvents": "Анонимные события использования (открытие приложения, попытки подключения, отправленные сообщения) — отправляется в PostHog EU",
+      "noCode": "Ваш код, промпты или сообщения чата",
+      "noServerUrls": "URL серверов или токены аутентификации"
+    },
+    "privacyLink": "Прочитать нашу полную политику конфиденциальности",
+    "declineA11yLabel": "Нет, спасибо, отклонить отчётность об ошибках и аналитику",
+    "declineButton": "Нет, спасибо",
+    "allowA11yLabel": "Разрешить анонимные отчёты об ошибках и аналитику использования",
+    "allowButton": "Разрешить",
+    "footnote": "Вы можете изменить это в любое время в Настройки → Конфиденциальность."
+  },
+  "authGate": {
+    "title": "OpenCode заблокирован",
+    "subtitle": "Пройдите аутентификацию для доступа к сессиям",
+    "unlockButton": "Разблокировать"
+  },
+  "chat": {
+    "permissionPrompt": {
+      "title": "Требуется разрешение",
+      "deny": "Запретить",
+      "always": "Всегда",
+      "allow": "Разрешить"
+    },
+    "questionPrompt": {
+      "headerFallback": "Вопрос",
+      "answerPlaceholder": "Введите ответ...",
+      "customAnswerLabel": "Введите свой ответ",
+      "dismiss": "Закрыть",
+      "next": "Далее",
+      "submit": "Отправить"
+    },
+    "statusIndicator": {
+      "retrying": "Повторная попытка (попытка {{attempt}})...",
+      "working": "Работаю..."
+    },
+    "slashPopover": {
+      "customBadge": "cmd"
+    },
+    "modelPicker": {
+      "title": "Выберите модель",
+      "searchPlaceholder": "Поиск моделей..."
+    },
+    "variantPicker": {
+      "title": "Уровень рассуждений",
+      "autoLabel": "Авто",
+      "autoDescription": "Использовать рассуждения по умолчанию",
+      "effort": {
+        "low": "Быстрее, менее тщательные рассуждения",
+        "medium": "Баланс рассуждений и скорости",
+        "high": "Глубокие, тщательные рассуждения"
+      }
+    },
+    "directorySwitcher": {
+      "title": "Переключить проект",
+      "serverDefaultLabel": "По умолчанию на сервере",
+      "browseLabel": "Обзор…",
+      "recentProjectsLabel": "Недавние проекты",
+      "usesServerDir": "Использует рабочую директорию сервера"
+    },
+    "directoryBrowserSheet": {
+      "noActiveConnection": "Нет активного подключения",
+      "listFailed": "Не удалось получить список директорий",
+      "title": "Обзор папок",
+      "jumpPlaceholder": "Перейти к пути...",
+      "noSubfolders": "Нет подпапок",
+      "enterPathHint": "Введите путь выше для начала обзора",
+      "useFolderButton": "Использовать {{folder}}",
+      "thisFolderFallback": "эта папка"
+    },
+    "reasoningBlock": {
+      "label": "Рассуждение"
+    },
+    "toolCallCard": {
+      "fallbackTitle": "Инструмент",
+      "patternOnly": "Шаблон: {{pattern}}",
+      "patternWithPath": "Шаблон: {{pattern}} в {{path}}"
+    },
+    "sessionInfo": {
+      "noUsageData": "Данные об использовании пока отсутствуют",
+      "loading": "Загрузка...",
+      "loadAllMessages": "Загрузить все сообщения",
+      "jumpToBeginning": "Перейти к началу",
+      "pills": {
+        "in": "Вход",
+        "out": "Выход",
+        "think": "Мысль",
+        "cacheRead": "КэшЧт",
+        "cacheWrite": "КэшЗап"
+      },
+      "meta": {
+        "created": "Создано",
+        "updated": "Обновлено",
+        "messages": "Сообщения",
+        "changes": "Изменения",
+        "shared": "Общий доступ",
+        "yes": "Да"
+      },
+      "time": {
+        "justNow": "только что",
+        "minutesAgo": "{{count}} мин. назад",
+        "hoursAgo": "{{count}} ч. назад",
+        "daysAgo": "{{count}} дн. назад"
+      }
+    }
+  },
+  "demo": {
+    "title": "Демо",
+    "banner": "Демо — пример разговора, сервер не подключён",
+    "ctaTitle": "Нравится?",
+    "ctaSubtitle": "Это был подготовленный демо-ролик. Подключите свой сервер opencode, чтобы сделать это по-настоящему.",
+    "connectButton": "Подключить свой сервер",
+    "setupGuideLink": "Как настроить сервер",
+    "hostedCtaLink": "Нет сервера? Присоединяйтесь к листу ожидания OpenCode Connect — хостинг, без настройки"
+  },
+  "update": {
+    "available": "Доступно обновление",
+    "body": "Вышла версия {{version}}. У вас {{current}}.",
+    "action": "Получить",
+    "dismiss": "Не сейчас",
+    "upToDate": "Уже актуально"
+  }
+}

@@ -1,0 +1,193 @@
+name: Sync & Build with Russian Locale
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+env:
+  ORIGINAL_REPO: dzianisv/opencode-mobile
+  SELF_REPO: Gegaremant/OpenCode_Mobile_RU
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GIT_TOKEN }}
+
+      - name: Get latest release from original repo
+        id: latest_release
+        run: |
+          LATEST=$(curl -s "https://api.github.com/repos/${{ env.ORIGINAL_REPO }}/releases/latest" | jq -r '.tag_name')
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $LATEST"
+
+      - name: Check if already synced
+        id: check_sync
+        run: |
+          if git tag -l "synced-${{ steps.latest_release.outputs.tag }}" | grep -q .; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            echo "Already synced ${{ steps.latest_release.outputs.tag }}, skipping."
+          else
+            echo "already_synced=false" >> "$GITHUB_OUTPUT"
+            echo "New release detected: ${{ steps.latest_release.outputs.tag }}"
+          fi
+
+      - name: Setup Node.js
+        if: steps.check_sync.outputs.already_synced == 'false'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Java
+        if: steps.check_sync.outputs.already_synced == 'false'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        if: steps.check_sync.outputs.already_synced == 'false'
+        uses: android-actions/setup-android@v4
+
+      - name: Cache Gradle
+        if: steps.check_sync.outputs.already_synced == 'false'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            android/.gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Clone original repo at release tag
+        if: steps.check_sync.outputs.already_synced == 'false'
+        run: |
+          rm -rf original-src
+          git clone --branch "${{ steps.latest_release.outputs.tag }}" --depth 1 \
+            "https://github.com/${{ env.ORIGINAL_REPO }}.git" original-src
+
+      - name: Apply Russian locale patch
+        if: steps.check_sync.outputs.already_synced == 'false'
+        run: |
+          set -euo pipefail
+          SRC=original-src
+
+          # 1. Copy ru.json into i18n directory
+          cp src/patches/ru.json "$SRC/src/lib/i18n/ru.json"
+
+          # 2. Patch locale-resolve.ts: add "ru" to SUPPORTED_LOCALES and matchSupportedLocale
+          RESOLVE="$SRC/src/lib/i18n/locale-resolve.ts"
+          sed -i 's/export const SUPPORTED_LOCALES = \["en", "zh-Hans"\] as const/export const SUPPORTED_LOCALES = ["en", "zh-Hans", "ru"] as const/' "$RESOLVE"
+          sed -i '/if (lower.startsWith("zh")) return "zh-Hans"/a\  if (lower.startsWith("ru")) return "ru"' "$RESOLVE"
+
+          # 3. Patch config.ts: import ru and add to resources
+          CONFIG="$SRC/src/lib/i18n/config.ts"
+          sed -i 's|import zhHans from "./zh-Hans.json"|import zhHans from "./zh-Hans.json"\nimport ru from "./ru.json"|' "$CONFIG"
+          sed -i 's|"zh-Hans": { translation: zhHans },|"zh-Hans": { translation: zhHans },\n  ru: { translation: ru },|' "$CONFIG"
+
+          # 4. Add "ru" language label to en.json and zh-Hans.json so the picker shows it
+          node -e "
+            const fs = require('fs');
+            for (const f of ['en.json', 'zh-Hans.json']) {
+              const p = '$SRC/src/lib/i18n/' + f;
+              const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+              if (j.settings && j.settings.language) j.settings.language.ru = 'Russian';
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+            }
+          "
+
+          # 5. Update app.json version with upstream tag
+          VERSION="${{ steps.latest_release.outputs.tag }}"
+          VERSION="${VERSION#v}"
+
+          node -e "
+            const fs = require('fs');
+            const app = JSON.parse(fs.readFileSync('$SRC/app.json', 'utf8'));
+            app.expo.version = '$VERSION';
+            fs.writeFileSync('$SRC/app.json', JSON.stringify(app, null, 2) + '\n');
+          "
+
+          echo "Russian locale patch applied successfully"
+
+      - name: Install dependencies
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: npm install --legacy-peer-deps
+
+      - name: Expo prebuild
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Setup signing
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: |
+          if [[ -n "${{ secrets.KEYSTORE_BASE64 }}" ]]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
+            echo "RELEASE_STORE_FILE=release.keystore" >> "$GITHUB_ENV"
+            echo "RELEASE_STORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            keytool -genkey -v -keystore android/app/debug.keystore -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build APK
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src/android
+        run: ./gradlew assembleRelease
+
+      - name: Get version from app.json
+        if: steps.check_sync.outputs.already_synced == 'false'
+        id: version
+        working-directory: original-src
+        run: |
+          VERSION=$(node -p "require('./app.json').expo.version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        if: steps.check_sync.outputs.already_synced == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: opencode-mobile-ru-${{ steps.version.outputs.version }}
+          path: original-src/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Push source changes to self repo
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add self "https://x-access-token:${{ secrets.GIT_TOKEN }}@github.com/${{ env.SELF_REPO }}.git"
+          git push self HEAD:main --force
+
+      - name: Create release in self repo
+        if: steps.check_sync.outputs.already_synced == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "OpenCode Mobile RU v${{ steps.version.outputs.version }}"
+          body: |
+            Автоматически собрано из [оригинального релиза ${{ steps.latest_release.outputs.tag }}](https://github.com/${{ env.ORIGINAL_REPO }}/releases/tag/${{ steps.latest_release.outputs.tag }})
+
+            С русской локализацией.
+          files: original-src/android/app/build/outputs/apk/release/app-release.apk
+          generate_release_notes: true
+
+      - name: Mark as synced
+        if: steps.check_sync.outputs.already_synced == 'false'
+        run: |
+          git tag "synced-${{ steps.latest_release.outputs.tag }}"
+          git push origin "synced-${{ steps.latest_release.outputs.tag }}"
