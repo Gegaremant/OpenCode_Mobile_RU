@@ -167,14 +167,14 @@ jobs:
         run: |
           VERSION=$(node -p "require('./app.json').expo.version")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          cp android/app/build/outputs/apk/release/app-release.apk OpenCode_mobile_ru.sapk
+          cp android/app/build/outputs/apk/release/app-release.apk OpenCode_mobile_ru.apk
 
       - name: Upload APK artifact
         if: steps.check_sync.outputs.already_synced == 'false'
         uses: actions/upload-artifact@v7
         with:
           name: opencode-mobile-ru-${{ steps.version.outputs.version }}
-          path: original-src/OpenCode_mobile_ru.sapk
+          path: original-src/OpenCode_mobile_ru.apk
 
       - name: Create release in self repo
         if: steps.check_sync.outputs.already_synced == 'false'
@@ -186,7 +186,7 @@ jobs:
             Автоматически собрано из [оригинального релиза ${{ steps.latest_release.outputs.tag }}](https://github.com/${{ env.ORIGINAL_REPO }}/releases/tag/${{ steps.latest_release.outputs.tag }})
 
             С русской локализацией.
-          files: original-src/OpenCode_mobile_ru.sapk
+          files: original-src/OpenCode_mobile_ru.apk
           generate_release_notes: true
 
       - name: Mark as synced
