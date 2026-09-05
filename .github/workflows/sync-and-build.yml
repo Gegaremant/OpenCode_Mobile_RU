@@ -203,14 +203,18 @@ jobs:
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src/android
         run: |
+          # --- pre-build diagnostics: what does Metro actually see? ---
+          echo "### config.ts ru line:"; grep -n 'ru:' ../src/lib/i18n/config.ts || echo "!!! config.ts has NO ru"
+          echo "### ru.json present:"; ls -la ../src/lib/i18n/ru.json 2>&1
+          echo "### ru.json first keys:"; head -c 200 ../src/lib/i18n/ru.json 2>&1
+          echo "### locale-resolve:"; grep -n 'ru' ../src/lib/i18n/locale-resolve.ts
+          echo "### settings.tsx:"; grep -n 'setLocale("ru")\|localeLabels.ru' "../app/(tabs)/settings.tsx" || echo "!!! no ru menu"
+
           # Force Metro to rebuild the JS bundle from the patched sources.
-          # A stale Gradle/Metro build-cache restored by actions/cache between
-          # runs was reusing the old (en-only) bundle. Wipe every cache that
-          # could carry the previous bundle, then clean-build.
           rm -rf .gradle
           rm -rf ~/.gradle/caches/build-cache-1
           rm -rf ../node_modules/.cache
-          rm -rf /tmp/metro-* /tmp/haste-map-* /tmp/*metro* 2>/dev/null || true
+          rm -rf /tmp/metro-* /tmp/haste-map-* 2>/dev/null || true
           ./gradlew --no-build-cache clean assembleRelease
 
       - name: Get version from app.json
