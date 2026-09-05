@@ -146,6 +146,21 @@ jobs:
 
           echo "Russian locale patch applied successfully"
 
+      - name: Diagnostics - verify patched locale files
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: |
+          echo "=== ru.json exists ==="
+          ls -la src/lib/i18n/ru.json || echo "MISSING ru.json"
+          echo "=== config.ts resources ==="
+          grep -n '"ru"\|ru: { translation' src/lib/i18n/config.ts || echo "NO ru in config.ts"
+          echo "=== locale-resolve.ts supported ==="
+          grep -n 'SUPPORTED_LOCALES\|"ru"' src/lib/i18n/locale-resolve.ts || echo "NO ru in locale-resolve.ts"
+          echo "=== en.json language section ==="
+          node -e "const j=require('./src/lib/i18n/en.json'); console.log(JSON.stringify(j.settings.language))"
+          echo "=== settings.tsx menu entries ==="
+          grep -n 'setLocale("ru")\|localeLabels.ru\|localeLabels\["zh-Hans"\]' "app/(tabs)/settings.tsx" || echo "NO ru menu in settings.tsx"
+
       - name: Install dependencies
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src
@@ -187,7 +202,12 @@ jobs:
       - name: Build APK
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src/android
-        run: ./gradlew assembleRelease
+        run: |
+          # Force Metro to rebuild the JS bundle from the patched sources:
+          # clear Metro/Hermes caches so stale en-only bundles are never reused.
+          rm -rf ../node_modules/.cache
+          rm -rf app/build/generated/assets app/build/generated/sourcemaps
+          ./gradlew --no-build-cache assembleRelease
 
       - name: Get version from app.json
         if: steps.check_sync.outputs.already_synced == 'false'
