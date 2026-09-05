@@ -104,34 +104,10 @@ jobs:
             }
           "
 
-          # 5. Patch the language-picker menu in settings.tsx so "Русский" appears
-          #    as an explicit option (the original menu is hardcoded to system/en/zh-Hans).
-          SETTINGS_TSX="$SRC/app/(tabs)/settings.tsx"
-          node -e "
-            const fs = require('fs');
-            const p = '$SETTINGS_TSX';
-            let src = fs.readFileSync(p, 'utf8');
-
-            // 5a. Add "ru" to localeLabels map
-            src = src.replace(
-              /\"zh-Hans\": t\(\"settings.language.zhHans\"\),/,
-              '\"zh-Hans\": t(\"settings.language.zhHans\"),\n    ru: t(\"settings.language.ru\"),'
-            );
-
-            // 5b. Add a "Русский" button to the Alert.alert language menu
-            src = src.replace(
-              /{ text: localeLabels\[\"zh-Hans\"\], onPress: \(\) => setLocale\(\"zh-Hans\"\) },/,
-              '{ text: localeLabels[\"zh-Hans\"], onPress: () => setLocale(\"zh-Hans\") },\n      { text: localeLabels.ru, onPress: () => setLocale(\"ru\") },'
-            );
-
-            // 5c. Make sure LocalePreference type includes ru at runtime picker (no-op guard)
-            if (!src.includes('localeLabels.ru')) {
-              console.error('settings.tsx patch FAILED: ru not found');
-              process.exit(1);
-            }
-            fs.writeFileSync(p, src);
-            console.log('settings.tsx language menu patched');
-          "
+          # 5. Replace the Alert-based language picker in settings.tsx with a
+          #    Modal that lists ALL locales. Android's Alert.alert silently
+          #    truncates buttons to 3, so "ru" (the 4th) could never appear.
+          node src/patches/patch-settings.js "$SRC"
 
           # 6. Update app.json version with upstream tag
           VERSION="${{ steps.latest_release.outputs.tag }}"
@@ -159,7 +135,7 @@ jobs:
           echo "=== en.json language section ==="
           node -e "const j=require('./src/lib/i18n/en.json'); console.log(JSON.stringify(j.settings.language))"
           echo "=== settings.tsx menu entries ==="
-          grep -n 'setLocale("ru")\|localeLabels.ru\|localeLabels\["zh-Hans"\]' "app/(tabs)/settings.tsx" || echo "NO ru menu in settings.tsx"
+          grep -n 'chooseLocale("ru")\|localeLabels.ru\|languagePickerVisible\|localeLabels\["zh-Hans"\]' "app/(tabs)/settings.tsx" || echo "NO ru menu in settings.tsx"
 
       - name: Install dependencies
         if: steps.check_sync.outputs.already_synced == 'false'
@@ -208,7 +184,7 @@ jobs:
           echo "### ru.json present:"; ls -la ../src/lib/i18n/ru.json 2>&1
           echo "### ru.json first keys:"; head -c 200 ../src/lib/i18n/ru.json 2>&1
           echo "### locale-resolve:"; grep -n 'ru' ../src/lib/i18n/locale-resolve.ts
-          echo "### settings.tsx:"; grep -n 'setLocale("ru")\|localeLabels.ru' "../app/(tabs)/settings.tsx" || echo "!!! no ru menu"
+          echo "### settings.tsx:"; grep -n 'chooseLocale("ru")\|localeLabels.ru\|languagePickerVisible' "../app/(tabs)/settings.tsx" || echo "!!! no ru menu"
 
           # Force Metro to rebuild the JS bundle from the patched sources.
           rm -rf .gradle
