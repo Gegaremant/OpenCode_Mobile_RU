@@ -104,7 +104,36 @@ jobs:
             }
           "
 
-          # 5. Update app.json version with upstream tag
+          # 5. Patch the language-picker menu in settings.tsx so "Русский" appears
+          #    as an explicit option (the original menu is hardcoded to system/en/zh-Hans).
+          SETTINGS_TSX="$SRC/app/(tabs)/settings.tsx"
+          node -e "
+            const fs = require('fs');
+            const p = '$SETTINGS_TSX';
+            let src = fs.readFileSync(p, 'utf8');
+
+            // 5a. Add "ru" to localeLabels map
+            src = src.replace(
+              /\"zh-Hans\": t\(\"settings.language.zhHans\"\),/,
+              '\"zh-Hans\": t(\"settings.language.zhHans\"),\n    ru: t(\"settings.language.ru\"),'
+            );
+
+            // 5b. Add a "Русский" button to the Alert.alert language menu
+            src = src.replace(
+              /{ text: localeLabels\[\"zh-Hans\"\], onPress: \(\) => setLocale\(\"zh-Hans\"\) },/,
+              '{ text: localeLabels[\"zh-Hans\"], onPress: () => setLocale(\"zh-Hans\") },\n      { text: localeLabels.ru, onPress: () => setLocale(\"ru\") },'
+            );
+
+            // 5c. Make sure LocalePreference type includes ru at runtime picker (no-op guard)
+            if (!src.includes('localeLabels.ru')) {
+              console.error('settings.tsx patch FAILED: ru not found');
+              process.exit(1);
+            }
+            fs.writeFileSync(p, src);
+            console.log('settings.tsx language menu patched');
+          "
+
+          # 6. Update app.json version with upstream tag
           VERSION="${{ steps.latest_release.outputs.tag }}"
           VERSION="${VERSION#v}"
 
