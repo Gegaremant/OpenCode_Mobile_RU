@@ -203,11 +203,15 @@ jobs:
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src/android
         run: |
-          # Force Metro to rebuild the JS bundle from the patched sources:
-          # clear Metro/Hermes caches so stale en-only bundles are never reused.
+          # Force Metro to rebuild the JS bundle from the patched sources.
+          # A stale Gradle/Metro build-cache restored by actions/cache between
+          # runs was reusing the old (en-only) bundle. Wipe every cache that
+          # could carry the previous bundle, then clean-build.
+          rm -rf .gradle
+          rm -rf ~/.gradle/caches/build-cache-1
           rm -rf ../node_modules/.cache
-          rm -rf app/build/generated/assets app/build/generated/sourcemaps
-          ./gradlew --no-build-cache assembleRelease
+          rm -rf /tmp/metro-* /tmp/haste-map-* /tmp/*metro* 2>/dev/null || true
+          ./gradlew --no-build-cache clean assembleRelease
 
       - name: Get version from app.json
         if: steps.check_sync.outputs.already_synced == 'false'
