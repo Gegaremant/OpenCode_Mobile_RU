@@ -109,7 +109,27 @@ jobs:
           #    truncates buttons to 3, so "ru" (the 4th) could never appear.
           node src/patches/patch-settings.js "$SRC"
 
-          # 6. Update app.json version with upstream tag
+          # 6. Markdown typography: bold runs overlapped the neighbouring lines
+          #    and the leading was far too tight (nested <Text> spans kept
+          #    react-native-marked's 16/24 defaults inside 15/22 body text).
+          node src/patches/patch-markdown.js "$SRC"
+
+          # 7. Keyboard: KeyboardAvoidingView pads nothing on Android (RN
+          #    reports screenY as the already-resized frame bottom) and the
+          #    edge-to-edge window is never resized, so the composer and the
+          #    connection forms were buried under the keyboard.
+          node src/patches/patch-keyboard.js "$SRC"
+
+          # 8. Voice input: classify/localize the "not-allowed" error, offer the
+          #    OS settings toggle, and recognise in the UI language.
+          node src/patches/patch-speech.js "$SRC"
+
+          # 9. Session archive (per chat + per project) and transcript export.
+          #    Adds src/components/ActionSheet.tsx because Android's Alert.alert
+          #    keeps only three buttons and these menus need five.
+          node src/patches/patch-archive.js "$SRC"
+
+          # 10. Update app.json version with upstream tag
           VERSION="${{ steps.latest_release.outputs.tag }}"
           VERSION="${VERSION#v}"
 
@@ -136,16 +156,52 @@ jobs:
           node -e "const j=require('./src/lib/i18n/en.json'); console.log(JSON.stringify(j.settings.language))"
           echo "=== settings.tsx menu entries ==="
           grep -n 'chooseLocale("ru")\|localeLabels.ru\|languagePickerVisible\|localeLabels\["zh-Hans"\]' "app/(tabs)/settings.tsx" || echo "NO ru menu in settings.tsx"
+          echo "=== markdown metrics ==="
+          grep -n 'BASE_TEXT\|lineHeight' src/components/markdown/Markdown.tsx | head -5 || echo "!!! markdown not patched"
+          echo "=== keyboard avoidance ==="
+          ls src/lib/keyboard-inset.ts || echo "!!! keyboard-inset.ts MISSING"
+          grep -c 'keyboardInset' "app/session/[id].tsx" app/connection/add.tsx "app/connection/[id].tsx" || echo "!!! keyboardInset unused"
+          echo "=== speech ==="
+          grep -n 'permissionDenied\|ru-RU' src/lib/speech.ts | head -5 || echo "!!! speech not patched"
+          echo "=== speech i18n ==="
+          node -e "const j=require('./src/lib/i18n/en.json'); console.log(JSON.stringify(j.chat.speechErrors))"
+          echo "=== archive ==="
+          ls src/lib/session-archive.ts src/components/ActionSheet.tsx || echo "!!! archive files MISSING"
+          node -e "const j=require('./src/lib/i18n/en.json'); console.log(JSON.stringify(j.sessionsList.archive.actions))"
+          grep -c 'sessionsList.archive' "app/(tabs)/index.tsx" || echo "!!! archive UI missing"
 
       - name: Install dependencies
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src
         run: npm install --legacy-peer-deps
 
+      # Metro strips types without checking them, so a broken patch would sail
+      # all the way to a signed APK. Catch it here instead.
+      - name: Typecheck patched sources
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: npm run typecheck
+
       - name: Expo prebuild
         if: steps.check_sync.outputs.already_synced == 'false'
         working-directory: original-src
         run: npx expo prebuild --platform android --no-install
+
+      - name: Guarantee RECORD_AUDIO for voice input
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src
+        run: |
+          set -euo pipefail
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          # Without RECORD_AUDIO the recognition module's start() is a no-op and
+          # its permission request fails silently — "voice input has no
+          # permissions" with no system dialog ever shown.
+          if ! grep -q 'android.permission.RECORD_AUDIO' "$MANIFEST"; then
+            echo "RECORD_AUDIO missing after prebuild — inserting"
+            sed -i 's|<application |<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n  <application |' "$MANIFEST"
+          fi
+          grep -q 'android.permission.RECORD_AUDIO' "$MANIFEST" || { echo "ERROR: RECORD_AUDIO still missing"; exit 1; }
+          echo "RECORD_AUDIO present"
 
       - name: Strip Sentry native upload
         if: steps.check_sync.outputs.already_synced == 'false'

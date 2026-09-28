@@ -256,6 +256,38 @@
     "actions": {
       "rename": "Переименовать"
     },
+    "archive": {
+      "badge": "в архиве",
+      "active": "Активные",
+      "archived": "Архив",
+      "empty": "В архиве пока пусто",
+      "actions": {
+        "archive": "В архив",
+        "restore": "Из архива",
+        "share": "Поделиться перепиской",
+        "copy": "Скопировать переписку",
+        "archiveProject": "Архивировать проект",
+        "restoreProject": "Восстановить проект"
+      },
+      "confirmTitle": "«{{verb}}»?",
+      "confirmMessage": "Чатов затронуто: {{count}}.",
+      "alerts": {
+        "partialTitle": "Завершено с ошибками",
+        "partialMessage": "Готово: {{done}}, с ошибкой: {{failed}}."
+      }
+    },
+    "export": {
+      "copiedTitle": "Переписка скопирована",
+      "copiedMessage": "Текст диалога в буфере обмена.",
+      "roleUser": "Вы",
+      "roleAssistant": "Ассистент",
+      "project": "Проект",
+      "updated": "Обновлён",
+      "alerts": {
+        "failedTitle": "Не удалось выгрузить",
+        "failedMessage": "Не получилось получить диалог с сервера."
+      }
+    },
     "alerts": {
       "renameFailedTitle": "Ошибка переименования",
       "renameFailedMessage": "Не удалось переименовать сессию. Пожалуйста, попробуйте снова.",
@@ -403,6 +435,11 @@
     },
     "reasoningBlock": {
       "label": "Рассуждение"
+    },
+    "speechErrors": {
+      "permissionDenied": "Нет доступа к микрофону. Разрешите его в настройках приложения и попробуйте снова.",
+      "unavailable": "Распознавание речи недоступно на этом устройстве.",
+      "openSettings": "Открыть настройки"
     },
     "toolCallCard": {
       "fallbackTitle": "Инструмент",
