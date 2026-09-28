@@ -232,6 +232,39 @@ session = replaceOnce(
 write(sessionRel, session)
 console.log(sessionRel + ": speech failure now explains itself and can open settings")
 
+// --- app.json: un-block RECORD_AUDIO ----------------------------------------
+//
+// The actual reason voice input could never work: app.json configures
+// expo-image-picker with `"microphonePermission": false`, and that plugin turns
+// the `false` into `AndroidConfig.Permissions.withBlockedPermissions([RECORD_AUDIO])`
+// (expo-image-picker/plugin/build/withImagePicker.js), i.e. it writes
+//
+//   <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove"/>
+//
+// into the app manifest. The merger honours the removal unconditionally, so
+// expo-speech-recognition's own `withPermissions([RECORD_AUDIO])` is discarded
+// and the release APK ships with no microphone permission at all — verified on
+// a locally built 0.4.15: the merged manifest and `aapt2 dump badging` have no
+// RECORD_AUDIO, and the module then reports "Missing RECORD_AUDIO permissions.".
+//
+// Giving image-picker a real description (it never requests the mic itself; only
+// speech-to-text does) drops the blocker, so the permission survives. The
+// runtime dialog still only appears when the mic is actually used.
+
+const appRel = "app.json"
+let appJson = read(appRel)
+
+appJson = replaceOnce(
+  appJson,
+  '"microphonePermission": false',
+  '"microphonePermission": "OpenCode uses the microphone for voice input (speech-to-text) of messages."',
+  "expo-image-picker microphonePermission",
+  appRel,
+)
+
+write(appRel, appJson)
+console.log(appRel + ": RECORD_AUDIO is no longer blocked for expo-image-picker")
+
 // --- i18n --------------------------------------------------------------------
 
 // en.json / zh-Hans.json ship upstream and are copied over on every sync, so the

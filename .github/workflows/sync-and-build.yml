@@ -193,15 +193,22 @@ jobs:
         run: |
           set -euo pipefail
           MANIFEST=android/app/src/main/AndroidManifest.xml
-          # Without RECORD_AUDIO the recognition module's start() is a no-op and
-          # its permission request fails silently — "voice input has no
-          # permissions" with no system dialog ever shown.
+          # expo-image-picker with `"microphonePermission": false` writes a
+          # `tools:node="remove"` entry for RECORD_AUDIO that the merger honours
+          # unconditionally, so a plain grep for the permission string passes
+          # while the permission is actually stripped from the APK. patch-speech.js
+          # removes the blocker; this asserts it is really gone.
+          if grep -q 'RECORD_AUDIO[^>]*tools:node="remove"\|RECORD_AUDIO.*node="remove"' "$MANIFEST"; then
+            echo "ERROR: RECORD_AUDIO is still blocked in the app manifest"
+            grep -n "RECORD_AUDIO" "$MANIFEST"
+            exit 1
+          fi
           if ! grep -q 'android.permission.RECORD_AUDIO' "$MANIFEST"; then
-            echo "RECORD_AUDIO missing after prebuild — inserting"
+            echo "RECORD_AUDIO missing from the app manifest — inserting"
             sed -i 's|<application |<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n  <application |' "$MANIFEST"
           fi
           grep -q 'android.permission.RECORD_AUDIO' "$MANIFEST" || { echo "ERROR: RECORD_AUDIO still missing"; exit 1; }
-          echo "RECORD_AUDIO present"
+          echo "RECORD_AUDIO declared and not blocked"
 
       - name: Strip Sentry native upload
         if: steps.check_sync.outputs.already_synced == 'false'
@@ -248,6 +255,28 @@ jobs:
           rm -rf ../node_modules/.cache
           rm -rf /tmp/metro-* /tmp/haste-map-* 2>/dev/null || true
           ./gradlew --no-build-cache clean assembleRelease
+
+      # The permission only has to exist in the *merged* manifest to matter, and
+      # the merged manifest is the artifact that actually ships.
+      - name: Verify the built APK
+        if: steps.check_sync.outputs.already_synced == 'false'
+        working-directory: original-src/android
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          AAPT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | tail -1)/aapt2"
+          [ -f "$APK" ] || { echo "ERROR: no APK at $APK"; exit 1; }
+          echo "APK: $(du -h "$APK" | cut -f1)"
+          BADGING=$("$AAPT" dump badging "$APK")
+          echo "$BADGING" | grep "uses-permission" | wc -l | xargs echo "permissions in APK:"
+          echo "$BADGING" | grep -q "android.permission.RECORD_AUDIO" \
+            || { echo "ERROR: RECORD_AUDIO is NOT in the APK — voice input cannot work"; exit 1; }
+          echo "RECORD_AUDIO confirmed in the APK"
+          MERGED=$(find app/build/intermediates -name AndroidManifest.xml -path "*merged_manifests/release*" | head -1)
+          if [ -n "$MERGED" ]; then
+            echo "merged manifest: $MERGED"
+            grep -c "RECORD_AUDIO" "$MERGED" | xargs echo "RECORD_AUDIO entries:"
+          fi
 
       - name: Get version from app.json
         if: steps.check_sync.outputs.already_synced == 'false'
