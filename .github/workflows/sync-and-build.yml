@@ -129,7 +129,25 @@ jobs:
           #    keeps only three buttons and these menus need five.
           node src/patches/patch-archive.js "$SRC"
 
-          # 10. Update app.json version with upstream tag
+          # 10. About/privacy links must point at THIS repository, not upstream.
+          node src/patches/patch-links.js "$SRC"
+
+          # 11. Autosave the composer's unsent text (debounced, per session).
+          node src/patches/patch-drafts.js "$SRC"
+
+          # 12. Dictation: pin Google's recognition service, prefer the on-device
+          #     model when it is downloaded, feed the recogniser the composer text.
+          node src/patches/patch-voice.js "$SRC"
+
+          # 13. Repaint: one coherent, WCAG-legible ramp replaces the hand-picked
+          #     greys and the violet accent. Must run last of the styling patches.
+          node src/patches/patch-palette.js "$SRC"
+
+          # 14. Theme preference (System/Light/Dark) on top of the new palette.
+          #     Needs ActionSheet from step 9, so it comes after patch-archive.
+          node src/patches/patch-theme.js "$SRC"
+
+          # 15. Update app.json version with upstream tag
           VERSION="${{ steps.latest_release.outputs.tag }}"
           VERSION="${VERSION#v}"
 
@@ -169,6 +187,20 @@ jobs:
           ls src/lib/session-archive.ts src/components/ActionSheet.tsx || echo "!!! archive files MISSING"
           node -e "const j=require('./src/lib/i18n/en.json'); console.log(JSON.stringify(j.sessionsList.archive.actions))"
           grep -c 'sessionsList.archive' "app/(tabs)/index.tsx" || echo "!!! archive UI missing"
+          echo "=== links point at this fork ==="
+          grep -n "Gegaremant/OpenCode_Mobile_RU" src/lib/links.ts "app/(tabs)/settings.tsx" | head -3
+          echo "=== drafts ==="
+          ls src/lib/session-draft.ts || echo "!!! session-draft.ts MISSING"
+          grep -c 'useSessionDraft' "app/session/[id].tsx" || echo "!!! composer not autosaving"
+          echo "=== voice tuning ==="
+          grep -n 'com.google.android.as\|requiresOnDeviceRecognition\|contextualStrings' src/lib/speech.ts | head -4
+          echo "=== theme ==="
+          ls src/lib/theme.ts || echo "!!! theme shim MISSING"
+          grep -rc 'useAppColorScheme' "app/(tabs)/settings.tsx" src/components/AuthGate.tsx | head -2
+          node -e "const j=require('./src/lib/i18n/ru.json'); console.log('ru theme:', JSON.stringify(j.settings.theme))"
+          echo "=== palette ==="
+          grep -c '#8b5cf6' "app/(tabs)/index.tsx" || echo "violet accent is gone"
+          grep -c '#999999' src/components/chat/MessageBubble.tsx || echo "old greys are gone"
 
       - name: Install dependencies
         if: steps.check_sync.outputs.already_synced == 'false'
