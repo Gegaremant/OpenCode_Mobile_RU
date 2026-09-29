@@ -12,5 +12,7 @@
 node_modules/
 original-src/
 android/
+dist/
 *.keystore
 *.jks
+*.apk
