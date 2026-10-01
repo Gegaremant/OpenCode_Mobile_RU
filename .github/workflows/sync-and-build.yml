@@ -362,8 +362,14 @@ jobs:
           # if the v2 client was actually compiled in, and their absence is the
           # exact symptom of "the app cannot talk to a v2 server" that we are
           # shipping against. See the README section on bundle diagnostics.
-          BUNDLE=../assets/index.android.bundle
-          [ -f "$BUNDLE" ] || { echo "ERROR: no JS bundle at $BUNDLE"; exit 1; }
+          #
+          # Read the bundle back out of the APK rather than guessing a path in
+          # the gradle tree — where prebuild leaves it varies between Expo
+          # versions, and only the packaged APK is what the user installs.
+          BUNDLE=$(mktemp -d)/index.android.bundle
+          unzip -p "$APK" assets/index.android.bundle > "$BUNDLE" \
+            || { echo "ERROR: no assets/index.android.bundle inside the APK"; exit 1; }
+          echo "bundle size: $(du -h "$BUNDLE" | cut -f1)"
           echo "=== v2 transport in bundle ==="
           for MARKER in "/api/info" "/api/session" "detectServerApi"; do
             if grep -qa -- "$MARKER" "$BUNDLE"; then
