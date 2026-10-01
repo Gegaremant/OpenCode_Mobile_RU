@@ -26,7 +26,7 @@ env:
   UPSTREAM_REF: v2
   # Android refuses to install over an equal or lower versionCode, so this has
   # to grow with every shipped APK. Bump by hand; it is the only manual step.
-  RU_VERSION_CODE: "43"
+  RU_VERSION_CODE: "44"
   SELF_REPO: Gegaremant/OpenCode_Mobile_RU
 
 jobs:
@@ -183,7 +183,11 @@ jobs:
           #     Needs ActionSheet from step 9, so it comes after patch-archive.
           node src/patches/patch-theme.js "$SRC"
 
-          # 15. Stamp our own version + versionCode.
+          # 15. Connection diagnostics: recognise a v2 server instead of
+          #     reporting the web SPA's 200 on /global/health as a healthy one.
+          node src/patches/patch-diagnostics.js "$SRC"
+
+          # 16. Stamp our own version + versionCode.
           #     The version name comes from upstream's app.json (so the release
           #     reads as "the RU build of 0.4.15") with the branch appended, and
           #     versionCode is ours to raise — Android refuses to install over
