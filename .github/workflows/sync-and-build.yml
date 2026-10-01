@@ -4,9 +4,29 @@ on:
   schedule:
     - cron: "0 */12 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this exact upstream commit was already built
+        type: boolean
+        default: false
 
+# ─── Where the app source comes from ──────────────────────────────────────────
+#
+# This block is the switch. opencode-mobile's v2 client (routes under /api/,
+# {data,cursor} envelopes, its own SSE format) lives in upstream PR #209 and is
+# not merged, so we track a branch on our own fork that carries that commit
+# verbatim. Once #209 lands upstream, set UPSTREAM_REF to main and delete the
+# fork — nothing else in this file needs to change.
+#
+# UPSTREAM_REF may be a branch or a tag. The build is keyed on the resolved
+# commit, not on the ref name, so moving the branch forward triggers a rebuild
+# on the next scheduled run.
 env:
-  ORIGINAL_REPO: dzianisv/opencode-mobile
+  UPSTREAM_REPO: Gegaremant/opencode-mobile
+  UPSTREAM_REF: v2
+  # Android refuses to install over an equal or lower versionCode, so this has
+  # to grow with every shipped APK. Bump by hand; it is the only manual step.
+  RU_VERSION_CODE: "43"
   SELF_REPO: Gegaremant/OpenCode_Mobile_RU
 
 jobs:
@@ -20,22 +40,32 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GIT_TOKEN }}
 
-      - name: Get latest release from original repo
-        id: latest_release
+      - name: Resolve upstream source
+        id: source
         run: |
-          LATEST=$(curl -s "https://api.github.com/repos/${{ env.ORIGINAL_REPO }}/releases/latest" | jq -r '.tag_name')
-          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "Latest upstream release: $LATEST"
+          set -euo pipefail
+          SHA=$(git ls-remote "https://github.com/${{ env.UPSTREAM_REPO }}.git" \
+            "refs/heads/${{ env.UPSTREAM_REF }}" "refs/tags/${{ env.UPSTREAM_REF }}" \
+            | awk '{print $1}' | head -1)
+          [ -n "$SHA" ] || { echo "ERROR: ${{ env.UPSTREAM_REF }} not found in ${{ env.UPSTREAM_REPO }}"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Source: ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_REF }} -> $SHA"
 
       - name: Check if already synced
         id: check_sync
         run: |
-          if git tag -l "synced-${{ steps.latest_release.outputs.tag }}" | grep -q .; then
+          set -euo pipefail
+          # Keyed on the commit, so a branch that moved rebuilds and an unchanged
+          # one does not. `force` re-runs a build whose output we already have.
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "already_synced=false" >> "$GITHUB_OUTPUT"
+            echo "force requested — rebuilding regardless of sync marker"
+          elif git tag -l "synced-${{ steps.source.outputs.sha }}" | grep -q .; then
             echo "already_synced=true" >> "$GITHUB_OUTPUT"
-            echo "Already synced ${{ steps.latest_release.outputs.tag }}, skipping."
+            echo "Already built ${{ steps.source.outputs.sha }}, skipping."
           else
             echo "already_synced=false" >> "$GITHUB_OUTPUT"
-            echo "New release detected: ${{ steps.latest_release.outputs.tag }}"
+            echo "New commit: ${{ steps.source.outputs.sha }}"
           fi
 
       - name: Setup Node.js
@@ -67,12 +97,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Clone original repo at release tag
+      - name: Clone upstream source at the resolved commit
         if: steps.check_sync.outputs.already_synced == 'false'
         run: |
+          set -euo pipefail
           rm -rf original-src
-          git clone --branch "${{ steps.latest_release.outputs.tag }}" --depth 1 \
-            "https://github.com/${{ env.ORIGINAL_REPO }}.git" original-src
+          # Clone the default branch, then check out the exact commit we keyed
+          # the build on — a clone --branch of a moving ref would not be pinned
+          # to what check_sync just verified.
+          git clone --depth 1 "https://github.com/${{ env.UPSTREAM_REPO }}.git" original-src
+          git -C original-src fetch --depth 1 origin "${{ steps.source.outputs.sha }}"
+          git -C original-src checkout --detach FETCH_HEAD
+          echo "checked out $(git -C original-src rev-parse HEAD)"
 
       - name: Apply Russian locale patch
         if: steps.check_sync.outputs.already_synced == 'false'
@@ -147,15 +183,20 @@ jobs:
           #     Needs ActionSheet from step 9, so it comes after patch-archive.
           node src/patches/patch-theme.js "$SRC"
 
-          # 15. Update app.json version with upstream tag
-          VERSION="${{ steps.latest_release.outputs.tag }}"
-          VERSION="${VERSION#v}"
-
+          # 15. Stamp our own version + versionCode.
+          #     The version name comes from upstream's app.json (so the release
+          #     reads as "the RU build of 0.4.15") with the branch appended, and
+          #     versionCode is ours to raise — Android refuses to install over
+          #     an equal or lower one, so shipping a rebuild of the same
+          #     upstream version without bumping it would be un-installable.
           node -e "
             const fs = require('fs');
             const app = JSON.parse(fs.readFileSync('$SRC/app.json', 'utf8'));
-            app.expo.version = '$VERSION';
+            const base = app.expo.version;
+            app.expo.version = base + '-ru.${{ env.UPSTREAM_REF }}';
+            app.expo.android.versionCode = Number('${{ env.RU_VERSION_CODE }}');
             fs.writeFileSync('$SRC/app.json', JSON.stringify(app, null, 2) + '\n');
+            console.log('version:', app.expo.version, 'versionCode:', app.expo.android.versionCode);
           "
 
           echo "Russian locale patch applied successfully"
@@ -178,7 +219,12 @@ jobs:
           grep -n 'BASE_TEXT\|lineHeight' src/components/markdown/Markdown.tsx | head -5 || echo "!!! markdown not patched"
           echo "=== keyboard avoidance ==="
           ls src/lib/keyboard-inset.ts || echo "!!! keyboard-inset.ts MISSING"
-          grep -c 'keyboardInset' "app/session/[id].tsx" app/connection/add.tsx "app/connection/[id].tsx" || echo "!!! keyboardInset unused"
+          # On the v2 client the chat screen uses react-native-keyboard-controller
+          # instead of our inset hook, so 0 there is correct; the connection
+          # forms are still ours on both generations and must use it.
+          grep -c 'keyboardInset' "app/session/[id].tsx" app/connection/add.tsx "app/connection/[id].tsx" || true
+          grep -q 'keyboardInset' app/connection/add.tsx || { echo "!!! keyboardInset missing from the connection form"; exit 1; }
+          echo "keyboardInset wired into the connection forms"
           echo "=== speech ==="
           grep -n 'permissionDenied\|ru-RU' src/lib/speech.ts | head -5 || echo "!!! speech not patched"
           echo "=== speech i18n ==="
@@ -310,6 +356,29 @@ jobs:
             grep -c "RECORD_AUDIO" "$MERGED" | xargs echo "RECORD_AUDIO entries:"
           fi
 
+          # The app ships a Hermes bundle, so Metro's non-ASCII escapes and the
+          # UTF-16LE string table mean plain grep finds nothing. Search for the
+          # ASCII-only v2 route markers instead: they can only be in the bundle
+          # if the v2 client was actually compiled in, and their absence is the
+          # exact symptom of "the app cannot talk to a v2 server" that we are
+          # shipping against. See the README section on bundle diagnostics.
+          BUNDLE=../assets/index.android.bundle
+          [ -f "$BUNDLE" ] || { echo "ERROR: no JS bundle at $BUNDLE"; exit 1; }
+          echo "=== v2 transport in bundle ==="
+          for MARKER in "/api/info" "/api/session" "detectServerApi"; do
+            if grep -qa -- "$MARKER" "$BUNDLE"; then
+              echo "  found: $MARKER"
+            else
+              echo "  MISSING: $MARKER — the v2 client is not in this build"
+            fi
+          done
+          grep -qa -- "/api/info" "$BUNDLE" || {
+            echo "ERROR: v2 client absent from the bundle. This build cannot talk to an opencode v2 server."
+            echo "       Check UPSTREAM_REPO / UPSTREAM_REF at the top of this workflow."
+            exit 1
+          }
+          echo "v2 client confirmed in the JS bundle"
+
       - name: Get version from app.json
         if: steps.check_sync.outputs.already_synced == 'false'
         id: version
@@ -333,7 +402,7 @@ jobs:
           tag_name: "v${{ steps.version.outputs.version }}"
           name: "OpenCode Mobile RU v${{ steps.version.outputs.version }}"
           body: |
-            Автоматически собрано из [оригинального релиза ${{ steps.latest_release.outputs.tag }}](https://github.com/${{ env.ORIGINAL_REPO }}/releases/tag/${{ steps.latest_release.outputs.tag }})
+            Автоматически собрано из `${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_REF }}` — коммит [${{ steps.source.outputs.sha }}](https://github.com/${{ env.UPSTREAM_REPO }}/commit/${{ steps.source.outputs.sha }}).
 
             С русской локализацией.
           files: original-src/OpenCode_mobile_ru.apk
@@ -342,5 +411,7 @@ jobs:
       - name: Mark as synced
         if: steps.check_sync.outputs.already_synced == 'false'
         run: |
-          git tag "synced-${{ steps.latest_release.outputs.tag }}"
-          git push origin "synced-${{ steps.latest_release.outputs.tag }}"
+          # Keyed on the commit, matching check_sync. Marking it on the ref name
+          # would make a moving branch look "already built" forever.
+          git tag "synced-${{ steps.source.outputs.sha }}"
+          git push origin "synced-${{ steps.source.outputs.sha }}"
