@@ -1,0 +1,4435 @@
+diff --git a/app/_layout.tsx b/app/_layout.tsx
+index c669aac..e2f31ef 100644
+--- a/app/_layout.tsx
++++ b/app/_layout.tsx
+@@ -4,6 +4,7 @@ import { StatusBar } from "expo-status-bar"
+ import { useColorScheme, View, ActivityIndicator, AppState } from "react-native"
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+ import { GestureHandlerRootView } from "react-native-gesture-handler"
++import { KeyboardProvider } from "react-native-keyboard-controller"
+ import { BottomSheetModalProvider } from "@gorhom/bottom-sheet"
+ import { I18nextProvider, useTranslation } from "react-i18next"
+ import i18n from "../src/lib/i18n/config"
+@@ -120,6 +121,22 @@ function RootLayout() {
+     return () => sub.remove()
+   }, [])
+ 
++  // Android freezes JS timers and usually drops the SSE socket while the app
++  // sits in the background (Doze/app standby), and the server may close idle
++  // streams too. On return to foreground, re-establish the stream immediately
++  // instead of waiting out the reconnect backoff (whose timers were frozen),
++  // and resync messages/permissions missed while away. reconnectNow() is
++  // idempotent, so an "active" fired by a transient "inactive" (biometric
++  // prompt, app switcher) is harmless.
++  useEffect(() => {
++    const sub = AppState.addEventListener("change", (next) => {
++      if (next === "active" && sseStarted.current) {
++        useEvents.getState().reconnectNow()
++      }
++    })
++    return () => sub.remove()
++  }, [])
++
+   // Connect/disconnect SSE and load catalog when client changes
+   useEffect(() => {
+     if (client && !sseStarted.current) {
+@@ -169,6 +186,10 @@ function RootLayout() {
+ 
+   return (
+     <ErrorBoundary>
++      {/* react-native-keyboard-controller: drives keyboard avoidance from
++          native WindowInsets instead of the legacy RN Keyboard events, which
++          misreport under Android's mandatory edge-to-edge mode (Expo SDK 54). */}
++      <KeyboardProvider>
+       <I18nextProvider i18n={i18n}>
+       <GestureHandlerRootView style={{ flex: 1 }}>
+         <BottomSheetModalProvider>
+@@ -226,6 +247,7 @@ function RootLayout() {
+         }}
+       />
+       </I18nextProvider>
++      </KeyboardProvider>
+     </ErrorBoundary>
+   )
+ }
+diff --git a/app/connection/add.tsx b/app/connection/add.tsx
+index b861608..2f837e0 100644
+--- a/app/connection/add.tsx
++++ b/app/connection/add.tsx
+@@ -133,6 +133,10 @@ export default function AddConnectionScreen() {
+             name: name.trim() || t("connection.shared.namePlaceholder"),
+             type: "local",
+             url: serverUrl,
++            // Carry the transport the pre-flight probe already determined, so the
++            // save does not probe the same server a second time.
++            api: result.api,
++            serverVersion: result.serverVersion,
+           },
+           password || undefined,
+         )
+@@ -209,6 +213,8 @@ export default function AddConnectionScreen() {
+             url: url.trim(),
+             directory: directory.trim() || undefined,
+             username: username.trim() || undefined,
++            api: result.api,
++            serverVersion: result.serverVersion,
+           },
+           password || undefined,
+         )
+diff --git a/app/session/[id].tsx b/app/session/[id].tsx
+index 97f885f..646c55f 100644
+--- a/app/session/[id].tsx
++++ b/app/session/[id].tsx
+@@ -7,7 +7,6 @@ import {
+   TouchableOpacity,
+   StyleSheet,
+   useColorScheme,
+-  KeyboardAvoidingView,
+   Platform,
+   ActivityIndicator,
+   Alert,
+@@ -20,6 +19,12 @@ import * as ImagePicker from "expo-image-picker"
+ import * as ImageManipulator from "expo-image-manipulator"
+ import * as Clipboard from "expo-clipboard"
+ import type BottomSheet from "@gorhom/bottom-sheet"
++// KeyboardAvoidingView from react-native-keyboard-controller (not react-native
++// core): core KAV relies on legacy Keyboard events whose metrics misreport
++// under Android's mandatory edge-to-edge mode (Expo SDK 54 / RN 0.81), leaving
++// the composer hidden behind the keyboard. This library drives avoidance from
++// native WindowInsets and is the standard fix for that setup.
++import { KeyboardAvoidingView } from "react-native-keyboard-controller"
+ import {
+   MessageBubble,
+   PermissionPrompt,
+@@ -30,6 +35,7 @@ import {
+   VariantPicker,
+   ImageAttachments,
+   SessionInfo,
++  MessageTextSheet,
+   type SlashCommand,
+   type Attachment,
+ } from "../../src/components/chat"
+@@ -39,6 +45,7 @@ import { useConnections } from "../../src/stores/connections"
+ import { useAuth } from "../../src/stores/auth"
+ import { useCatalog } from "../../src/stores/catalog"
+ import { useSpeech } from "../../src/lib/speech"
++import { messagePartsToSelectableText } from "../../src/lib/message-text"
+ 
+ // --- Builtin slash commands ---
+ const BUILTIN_COMMANDS: SlashCommand[] = [
+@@ -85,6 +92,8 @@ export default function SessionScreen() {
+   const [input, setInput] = useState("")
+   const [attachments, setAttachments] = useState<Attachment[]>([])
+   const [showInfo, setShowInfo] = useState(false)
++  // Raw text of the message opened in the full-screen selection sheet
++  const [textSheet, setTextSheet] = useState<string | null>(null)
+ 
+   const {
+     currentSession,
+@@ -93,6 +102,7 @@ export default function SessionScreen() {
+     isLoading,
+     loadingMore,
+     hasMore,
++    error,
+     selectSession,
+     sendMessage,
+     abortSession,
+@@ -190,10 +200,9 @@ export default function SessionScreen() {
+     [messages, parts, revertMessageID],
+   )
+ 
+-  // Tracks the latest composer text without pulling `input` into
+-  // handleMessageLongPress's deps — kept as a plain ref assignment (not
+-  // state) so the callback below stays referentially stable across
+-  // keystrokes for MessageBubble's custom memo comparator.
++  // Tracks the latest composer text without pulling `input` into startEditFlow's
++  // deps — kept as a plain ref assignment (not state) so the callback stays
++  // referentially stable across keystrokes for MessageBubble's memo comparator.
+   const inputRef = useRef(input)
+   inputRef.current = input
+ 
+@@ -218,38 +227,62 @@ export default function SessionScreen() {
+     )
+   }, [t])
+ 
+-  // Stable across renders (reads fresh state via getState() rather than
+-  // closing over props) so MessageBubble's custom memo comparator can bail
+-  // safely without risking a stale handler.
+-  const handleMessageLongPress = useCallback((messageID: string) => {
+-    Alert.alert(t("session.alerts.messageActionsTitle"), undefined, [
+-      { text: t("common.cancel"), style: "cancel" },
+-      {
+-        text: t("session.actions.editMessage"),
+-        onPress: () => {
+-          const doRevert = async () => {
+-            const result = await useSessions.getState().revertToMessage(messageID)
+-            applyRevertResult(result)
+-          }
+-          // Editing overwrites the composer — don't silently clobber an
+-          // in-progress unsent draft.
+-          if (inputRef.current.trim()) {
+-            Alert.alert(
+-              t("session.alerts.replaceDraftTitle"),
+-              t("session.alerts.replaceDraftMessage"),
+-              [
+-                { text: t("common.cancel"), style: "cancel" },
+-                { text: t("session.actions.replace"), style: "destructive", onPress: doRevert },
+-              ],
+-              { cancelable: false },
+-            )
+-            return
+-          }
+-          doRevert()
+-        },
+-      },
+-    ])
+-  }, [applyRevertResult, t])
++  // Full-screen selectable view: native text selection can't be trusted inside
++  // FlatList rows on Android (react-native#46999), so selection happens in a
++  // plain ScrollView outside the list. Reached from the assistant bubble's
++  // "Select text" button (a tap — assistant bubbles have no long-press) and
++  // from the user bubble's long-press action sheet. Covers the whole message:
++  // assistant text, reasoning and tool calls (name/input/result/error), not
++  // just text parts. Stable so MessageBubble's memo comparator can bail early.
++  const openSelectTextSheet = useCallback(
++    (messageID: string) => {
++      const messageParts = useSessions.getState().parts[messageID] || []
++      setTextSheet(
++        messagePartsToSelectableText(messageParts, {
++          thinking: t("session.sheet.thinking"),
++          tool: t("session.sheet.tool"),
++          input: t("session.sheet.input"),
++          result: t("session.sheet.result"),
++          error: t("session.sheet.error"),
++          file: t("session.sheet.file"),
++        }),
++      )
++    },
++    [t],
++  )
++
++  // Editing a user message reverts the session to it and loads it into the
++  // composer. Reached from the user bubble's "Edit" button and from its
++  // long-press action sheet. Stable so MessageBubble's memo comparator bails.
++  const startEditFlow = useCallback(
++    (messageID: string) => {
++      const doRevert = async () => {
++        const result = await useSessions.getState().revertToMessage(messageID)
++        applyRevertResult(result)
++      }
++      // Editing overwrites the composer — don't silently clobber an
++      // in-progress unsent draft.
++      if (inputRef.current.trim()) {
++        Alert.alert(
++          t("session.alerts.replaceDraftTitle"),
++          t("session.alerts.replaceDraftMessage"),
++          [
++            { text: t("common.cancel"), style: "cancel" },
++            { text: t("session.actions.replace"), style: "destructive", onPress: doRevert },
++          ],
++          { cancelable: false },
++        )
++        return
++      }
++      doRevert()
++    },
++    [applyRevertResult, t],
++  )
++
++  // Message actions live in the bubble header as buttons (Select text / Edit),
++  // so there is no long-press action sheet here any more — holding a message
++  // must not pop a menu, because a long-press on the bubble competed with
++  // horizontal scrolling in code blocks and with text selection.
+ 
+   const scrollToBottom = useCallback((animated = true) => {
+     flatListRef.current?.scrollToOffset({ offset: 0, animated })
+@@ -593,19 +626,21 @@ export default function SessionScreen() {
+ 
+       <KeyboardAvoidingView
+         style={[s.container, isDark && s.containerDark]}
+-        // Both platforms use "padding" so the composer/toolbar is pushed up
+-        // above the keyboard via JS-measured keyboard height.
+-        //
+-        // Android previously relied on the native android:windowSoftInputMode
+-        // (adjustResize, see AndroidManifest.xml) with behavior={undefined}
+-        // to let the OS resize the window (see #70/#53). Since adopting
+-        // Expo's mandatory edge-to-edge display, Android no longer resizes
+-        // the window when the keyboard opens — the system assumes insets are
+-        // handled dynamically — so adjustResize became a no-op and the
+-        // bottom toolbar + input were left completely hidden behind the
+-        // keyboard (#147). "padding" restores avoidance without depending
+-        // on native resize.
++        // "padding" pushes the composer/toolbar above the keyboard. On Android
++        // the padding is driven by react-native-keyboard-controller's native
++        // inset tracking (see import note above); on iOS by the keyboard frame
++        // events. History: this screen previously used the core RN KAV with
++        // behavior="padding" (#147), which regressed under edge-to-edge — the
++        // core component's JS-measured keyboard height no longer matched the
++        // real inset, so the input stayed hidden behind the keyboard.
+         behavior="padding"
++        // automaticOffset: measure this view's true on-screen position via
++        // native viewPositionInWindow instead of the layout-relative frame.
++        // Under RN core edge-to-edge the content area is already inset by
++        // status/nav bars, so layout-relative math under-counts the keyboard
++        // padding by exactly those insets (composer ends up partly behind the
++        // keyboard — measured 609px of padding for an 820px IME inset).
++        automaticOffset
+         keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
+       >
+         {/* Session info pulldown */}
+@@ -626,6 +661,23 @@ export default function SessionScreen() {
+           onClose={() => setShowInfo(false)}
+         />
+ 
++        {/* Full-screen selectable text (message action sheet -> "Select text") */}
++        <MessageTextSheet visible={textSheet !== null} text={textSheet ?? ""} onClose={() => setTextSheet(null)} />
++
++        {/* Session error (agent run failed) — session.error SSE event sets
++            this while the user is viewing the session. Dismissible; also
++            cleared by the next send. */}
++        {error && (
++          <View style={[s.banner, s.bannerError]}>
++            <Text style={[s.bannerText, s.bannerErrorText]} numberOfLines={3}>
++              {error}
++            </Text>
++            <TouchableOpacity onPress={() => useSessions.setState({ error: null })} hitSlop={8}>
++              <Text style={s.bannerErrorAction}>{t("session.banners.dismiss")}</Text>
++            </TouchableOpacity>
++          </View>
++        )}
++
+         {/* SSE reconnect/connected banner */}
+         {reconnectAttempts > 0 && (
+           <View style={[s.banner, s.bannerReconnecting]}>
+@@ -675,7 +727,8 @@ export default function SessionScreen() {
+                   message={item.message}
+                   parts={item.parts}
+                   isDark={isDark}
+-                  onLongPress={handleMessageLongPress}
++                  onSelectText={openSelectTextSheet}
++                  onEdit={startEditFlow}
+                 />
+               )}
+               contentContainerStyle={s.messageList}
+@@ -1057,6 +1110,17 @@ const s = StyleSheet.create({
+   bannerConnected: { backgroundColor: "#065f46" },
+   bannerText: { color: "#ffffff", fontSize: 13, fontWeight: "500" },
+ 
++  // Session error banner (agent run failed)
++  bannerError: {
++    backgroundColor: "#991b1b",
++    flexDirection: "row",
++    justifyContent: "space-between",
++    alignItems: "center",
++    gap: 12,
++  },
++  bannerErrorAction: { color: "#fecaca", fontSize: 13, fontWeight: "700" },
++  bannerErrorText: { flex: 1 },
++
+   // Pending revert (edit message) banner
+   bannerRevert: {
+     backgroundColor: "#1e3a8a",
+diff --git a/docs/v2-api-map.md b/docs/v2-api-map.md
+new file mode 100644
+index 0000000..ec99d1b
+--- /dev/null
++++ b/docs/v2-api-map.md
+@@ -0,0 +1,122 @@
++# opencode v2 HTTP API map (verified against v2.0.16, /openapi.json + live probe)
++
++Authoritative source: `GET /openapi.json` on any v2 server (OpenAPI 3.1, ~113 paths).
++Full spec saved at `/tmp/opencode/openapi.json`; extracted schemas in
++`/tmp/opencode/schemas.txt`, `api2.txt`, `api3.txt`, `api4.txt`; live event
++capture in `/tmp/opencode/events_full.txt`.
++
++## Breaking changes vs v1 (what the app used)
++
++1. **All API routes moved under `/api/`**. Old paths (`/session`, `/global/event`,
++   `/global/health`, `/file`, `/provider`, ...) now fall through to the SPA web UI
++   (HTML 200) — so the app silently renders garbage instead of erroring.
++2. **Envelope responses**: list endpoints return `{data: [...], cursor?}` or
++   `{location, data}` instead of bare arrays.
++3. **Health**: `/global/health` gone → `GET /api/info` → `{version, pid, urls, paths}`.
++4. **Auth**: same Basic auth (`OPENCODE_SERVER_PASSWORD`), username defaults `opencode`
++   (check headers.ts — v1 used `OPENCODE`? verify) → 401 on wrong creds.
++5. **Events SSE** `/api/event` (was `/global/event`): events are
++   `{id: "evt_...", type: "...", data: {...}}` (was `{type, properties}`).
++6. **Messages**: no more `MessageWithParts` (`info` + `parts[]`). Typed messages:
++   - `user`: `{id, time, type:"user", text, files?, agents?, skills?}`
++   - `assistant`: `{id, time:{created,streamed?,completed?}, type:"assistant", agent, model:{id,providerID,variant?}, content:[Text|Reasoning|Tool], snapshot?, finish?, cost, tokens, error?, retry?}`
++     - content Text: `{type:"text", text}`
++     - content Reasoning: `{type:"reasoning", text, time?}`
++     - content Tool: `{type:"tool", id, name, executed?, state: ToolState, time}`
++       - ToolState: `streaming {input:string}` | `running {input,metadata}` | `completed {input, content:[Tool.Content], metadata}` | `error {input, error, content?}`
++       - Tool.Content: `{type:"text", text}` or `{type:"file", ...}` (Tool.TextContent / Tool.FileContent)
++   - others: `idle {outcome}`, `compaction`, `system`, `synthetic`, `shell`, `skill`,
++     `agent-switched`, `model-switched`, `location-switched`
++7. **Prompt**: `POST /api/session/{id}/prompt` body `{text, files?:[{uri,name}], agents?, skills?, delivery?: "steer"|"queue", resume?}`.
++   Model/agent are session state, set via `POST /api/session/{id}/model {model:{id,providerID,variant?}}` and `POST /api/session/{id}/agent {agent}` — NOT per-prompt.
++8. **Command**: `POST /api/session/{id}/command {name, text}`.
++9. **Abort** → `POST /api/session/{id}/interrupt`.
++10. **Session list**: `GET /api/session?limit&order&search&directory&project&cursor` → `{data: Session.Info[], cursor:{previous,next}}`. No more `/experimental/session`.
++11. **Session.Info**: `{id, projectID, agent?, model?, cost, tokens, outcome?, time:{created,updated,idle?,viewed?,archived?}, title?, subpath?, metadata?, permissions?, revert?, location:{directory}}`. No `slug`, no `version`, no `share`, no `summary`.
++12. **Diff**: `GET /api/session/{id}/diff` → `{data: FileDiff.Info[]}` where
++    FileDiff.Info = `{file, patch, additions, deletions, status:"added"|"deleted"|"modified"}`.
++13. **Revert**: stage `POST .../revert/stage {messageID, files?}`; commit `POST .../revert/commit`; unstage `DELETE .../revert`. Session.Info.revert = `{messageID, partID?, snapshot?, files?}`.
++14. **Permissions**: list `GET /api/session/{id}/permission` → `{data:[Permission.Request]}`;
++    Permission.Request = `{id:"per...", sessionID, action, resources:[string], save?, metadata?, source?, message?}`;
++    reply `POST /api/session/{id}/permission/{requestID}/reply {decision:"once"|"always"|"reject", message?}`.
++    Global list: `GET /api/permission/request`.
++15. **Questions → Forms**: `GET /api/session/{id}/form` → `{data:[Form.Info]}`;
++    Form.Info = `{id:"frm_...", sessionID, title, fields}` (typed fields: string/number/integer/boolean/multiselect/external);
++    reply `POST .../form/{formID}/reply {answer}`; reject = `DELETE .../form/{formID}`.
++    The `question` tool is a form on the server (`title:"Questions"`, field keys `q0..qN`,
++    `metadata.kind:"question"`). Its SSE event **nests the form**: `form.created`
++    carries `{form: Form.Info}`, while `permission.asked` carries the flat
++    Permission.Request — reading `form.created` off `data` directly drops it
++    (live capture `evt_0d4be7612002H8CTkutJnzghGX` on v2.0.16).
++16. **Agents**: `GET /api/agent` → `{location, data:[Agent.Info]}`;
++    Agent.Info = `{id, name, model?, request, system?, description?, mode, hidden, color?, steps?, permissions}`.
++17. **Commands list**: `GET /api/command` → `{location, data:[Command.Info]}`.
++18. **Providers/models**: `GET /api/provider` → `{location, data:[Provider.Info]}`;
++    models: `GET /api/model` → `{location, data:[Model.Info]}`; Model.Info =
++    `{id, modelID, providerID, name, capabilities, variants[], time, cost[], status, enabled, limit:{context,output}}`.
++    Default: `GET /api/model/default`.
++19. **Filesystem**: `GET /api/fs/list?path=` → `{location, data:[{path,type:"file"|"directory"}]}`;
++    `GET /api/fs/find`, `GET /api/fs/read/*`, `POST /api/experimental/fs/write`. No `/file/roots`.
++20. **Location** (was `/path` + directory header): `GET /api/location` → `{directory, project:{id,directory,canonical}}`.
++    Project list `GET /api/project` → array of `{id, canonical, time, sandboxes}`.
++21. **Config**: `GET /api/config` → array of config documents.
++22. **Active sessions**: `GET /api/session/active` → `{data: {ses_xxx: {type:"running"}}}`.
++
++## Event types (live-verified + from binary strings)
++
++Core execution: `session.execution.started|failed|interrupted|succeeded`
++Steps: `session.step.started {sessionID, agent, model, assistantMessageID, started}`,
++`session.step.streamed`, `session.step.ended {finish, rawFinish, cost, tokens}`, `session.step.failed`
++Text: `session.text.started|delta|ended {assistantMessageID, ordinal, delta|text}`
++Reasoning: `session.reasoning.started|delta|ended` (same shape, `ended` has full `text`)
++Tools: `session.tool.input.started {id,name}`, `.input.delta`, `.input.ended {text}`,
++`.called {id, input, executed}`, `.progress`, `.success {id, content:[Tool.Content], metadata, executed}`, `.failed`
++Usage: `session.usage.updated {sessionID, cost, tokens}`, `.usage.recorded`
++Inbox: `session.inbox.enqueued {inboxID, sessionID, item}`, `.delivered`, `.cancelled`, `.delivery.changed`
++Lifecycle: `session.created`, `session.updated`, `session.deleted`, `session.renamed`, `session.moved`, `session.forked`, `session.viewed`, `session.metadata.updated`
++Selections: `session.agent.selected`, `session.model.selected`
++Compaction: `session.compaction.started|delta|ended|failed`
++Shell: `session.shell.started|ended`
++Other: `session.skill.activated`, `session.retry.scheduled`, `session.message.content.updated`,
++`session.instructions.updated`, `session.error`, `project.updated`, `server.connected`
++Permissions: `permission.asked`, `permission.replied`, `permission.rejected`
++Forms: `form.created {form:Form.Info}`, `form.replied {id,sessionID,answer}`, `form.cancelled {id,sessionID}`
++
++## Verified probe notes
++
++- `POST /api/session {title}` → `{data: Session.Info}` (probe: sid `ses_...`).
++- Prompt POST returns `{data: userMessage}` immediately (fire-and-forget like v1).
++- `GET /api/session/{id}/message` returns newest-first (`order` param available);
++  includes `idle` messages (`{type:"idle", outcome:"succeeded"}`).
++- SSE line format: `data: {"id":"evt_...","type":"...","data":{...}}`, `: heartbeat` comments.
++- Model set probe `{providerID, modelID}` at top level → 400; correct body is `{model:{id, providerID}}`.
++
++## v1 servers (opencode <= 1.18.x) — verified against 1.18.32
++
++`npm install -g opencode-ai` still installs the v1 line (`latest` = 1.18.32 as of
++2026-09-24), so v1 servers are the common case, not a legacy edge case. The v1
++transport lives in `src/lib/sdk-v1.ts` and `src/lib/api-detect.ts` picks it.
++
++Detection is by **content type, never status code** — an unknown route on either
++server falls through to the web SPA and answers `200 text/html`:
++
++| probe | v2.0.16 | 1.18.32 |
++| --- | --- | --- |
++| `GET /api/info` | `401` unauthenticated / `200 application/json` with `{version,pid,urls,paths}` | `200 text/html` (SPA) |
++| `GET /global/health` | `200 text/html` (SPA) | `200 application/json` `{healthy,version}` |
++
++Live-verified v1 behaviour (all through `src/lib/sdk-v1.ts` against a local
++`opencode serve` on 1.18.32):
++
++- `GET /global/health` → `{"healthy":true,"version":"1.18.32"}`.
++- `/session`, `/session/{id}`, `POST /session`, `PATCH /session/{id}`,
++  `DELETE /session/{id}`, `/session/{id}/message`, `/session/{id}/abort`,
++  `/session/{id}/prompt_async`, `/experimental/session`, `/question`,
++  `/permission`, `/agent`, `/command`, `/provider`, `/path`, `/project/current`
++  all answer JSON as the pre-v2 client expects.
++- `/file/roots` is already gone in 1.18.32 → falls through to the SPA, which is
++  why `file.roots()` must keep tolerating a non-JSON answer instead of assuming 404.
++- SSE line format: `data: {"payload":{"id":"evt_...","type":"...","properties":{...}}}`
++  — the event is wrapped in `payload` (v2 has no wrapper), and `events.ts` unwraps
++  with `event.payload || event`. Heartbeats arrive as `server.heartbeat` events
++  rather than v2's `: heartbeat` comment frames.
+diff --git a/package-lock.json b/package-lock.json
+index 7a846b5..0ca4b70 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -35,6 +35,7 @@
+         "react-i18next": "^17.0.10",
+         "react-native": "0.81.5",
+         "react-native-gesture-handler": "~2.28.0",
++        "react-native-keyboard-controller": "^1.22.5",
+         "react-native-marked": "8.0.0",
+         "react-native-reanimated": "~4.1.1",
+         "react-native-safe-area-context": "~5.6.0",
+@@ -8515,6 +8516,20 @@
+         "react-native": "*"
+       }
+     },
++    "node_modules/react-native-keyboard-controller": {
++      "version": "1.22.5",
++      "resolved": "https://registry.npmjs.org/react-native-keyboard-controller/-/react-native-keyboard-controller-1.22.5.tgz",
++      "integrity": "sha512-JS989QM4OpO17WmxoG/TK734ypfCL2ypMS1lClN7HAP0fNccfXkF+oIKhw25QDXOBZIcd/jhnLmoel7LFh1z9g==",
++      "license": "MIT",
++      "dependencies": {
++        "react-native-is-edge-to-edge": "^1.2.1"
++      },
++      "peerDependencies": {
++        "react": "*",
++        "react-native": "*",
++        "react-native-reanimated": ">=3.0.0"
++      }
++    },
+     "node_modules/react-native-marked": {
+       "version": "8.0.0",
+       "resolved": "https://registry.npmjs.org/react-native-marked/-/react-native-marked-8.0.0.tgz",
+diff --git a/package.json b/package.json
+index b24a733..5455d09 100644
+--- a/package.json
++++ b/package.json
+@@ -40,6 +40,7 @@
+     "react-i18next": "^17.0.10",
+     "react-native": "0.81.5",
+     "react-native-gesture-handler": "~2.28.0",
++    "react-native-keyboard-controller": "^1.22.5",
+     "react-native-marked": "8.0.0",
+     "react-native-reanimated": "~4.1.1",
+     "react-native-safe-area-context": "~5.6.0",
+diff --git a/src/components/chat/DiffView.tsx b/src/components/chat/DiffView.tsx
+index 00c66c0..32cc75e 100644
+--- a/src/components/chat/DiffView.tsx
++++ b/src/components/chat/DiffView.tsx
+@@ -1,5 +1,5 @@
+-import { View, Text, StyleSheet, Platform, ScrollView } from "react-native"
+-import { WIDE_CONTENT_SCROLL_CONFIG } from "../../lib/scroll-config"
++import { View, Text, StyleSheet, Platform } from "react-native"
++import { wideTextSelection } from "../../lib/scroll-config"
+ import { computeDiff } from "./diff-compute"
+ 
+ const mono = Platform.OS === "ios" ? "Menlo" : "monospace"
+@@ -12,40 +12,41 @@ interface Props {
+ 
+ export function DiffView({ before, after, isDark }: Props) {
+   const lines = computeDiff(before, after)
++  const sel = wideTextSelection(Platform.OS)
+ 
+   if (lines.length === 0) return null
+ 
+   return (
+-    <View style={[s.container, isDark && s.containerDark]}>
+-      <ScrollView {...WIDE_CONTENT_SCROLL_CONFIG} testID="diff-view-scroll">
+-        <View>
+-          {lines.map((line, idx) => (
+-            <View
+-              key={idx}
+-              style={[
+-                s.line,
+-                line.type === "add" && (isDark ? s.addDark : s.add),
+-                line.type === "remove" && (isDark ? s.removeDark : s.remove),
+-              ]}
+-            >
+-              <Text style={[s.prefix, isDark && s.prefixDark]}>
+-                {line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}
+-              </Text>
+-              <Text
+-                style={[
+-                  s.text,
+-                  isDark && s.textDark,
+-                  line.type === "add" && s.addText,
+-                  line.type === "remove" && s.removeText,
+-                ]}
+-                selectable
+-              >
+-                {line.text}
+-              </Text>
+-            </View>
+-          ))}
++    <View style={[s.container, isDark && s.containerDark]} testID="diff-view">
++      {lines.map((line, idx) => (
++        <View
++          key={idx}
++          style={[
++            s.line,
++            line.type === "add" && (isDark ? s.addDark : s.add),
++            line.type === "remove" && (isDark ? s.removeDark : s.remove),
++          ]}
++        >
++          <Text style={[s.prefix, isDark && s.prefixDark]}>
++            {line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}
++          </Text>
++          {/* s.text is flex:1 with no numberOfLines, so a long diff line folds
++              inside its own row: the +/- gutter stays aligned with the line it
++              belongs to, and nothing is truncated (issue #21). Wrapping is
++              rendering only — the diff text itself is untouched. */}
++          <Text
++            style={[
++              s.text,
++              isDark && s.textDark,
++              line.type === "add" && s.addText,
++              line.type === "remove" && s.removeText,
++            ]}
++            selectable={sel.selectable}
++          >
++            {line.text.length > 0 ? line.text : " "}
++          </Text>
+         </View>
+-      </ScrollView>
++      ))}
+     </View>
+   )
+ }
+@@ -79,6 +80,9 @@ const s = StyleSheet.create({
+   prefixDark: { color: "#666666" },
+ 
+   text: {
++    // flex:1 is what makes the fold happen inside the row instead of pushing the
++    // row wider than the screen.
++    flex: 1,
+     fontSize: 12,
+     fontFamily: mono,
+     color: "#0a0a0a",
+diff --git a/src/components/chat/MessageBubble.tsx b/src/components/chat/MessageBubble.tsx
+index 0f82eca..6fec496 100644
+--- a/src/components/chat/MessageBubble.tsx
++++ b/src/components/chat/MessageBubble.tsx
+@@ -1,10 +1,11 @@
+ import { memo } from "react"
+-import { View, Text, Image, StyleSheet, ScrollView, TouchableOpacity, Dimensions } from "react-native"
++import { View, Text, Image, StyleSheet, ScrollView, TouchableOpacity, Dimensions, Platform } from "react-native"
+ import { Ionicons } from "@expo/vector-icons"
+ import { Markdown } from "../markdown"
+ import { ToolCallCard } from "./ToolCallCard"
+ import { ReasoningBlock } from "./ReasoningBlock"
+ import type { Message, Part } from "../../lib/sdk"
++import { hasSelectableContent } from "../../lib/message-text"
+ 
+ const SCREEN_WIDTH = Dimensions.get("window").width
+ 
+@@ -16,16 +17,20 @@ interface Props {
+   message: Message
+   parts: Part[]
+   isDark: boolean
+-  // Only wired up for user messages — long-press opens the "Edit message" /
+-  // revert action sheet. Identified by messageID (not a closure over parts)
+-  // so it stays correct even if the memo below bails on a stale render.
+-  onLongPress?: (messageID: string) => void
++  // Message actions arrive as buttons in the bubble header (see the header
++  // comment in the render). There is deliberately no bubble-wide press or
++  // long-press: it competed with horizontal scrolling in code blocks and with
++  // text selection, and holding a message no longer pops anything. Handlers are
++  // identified by messageID (not a closure over parts) so they stay correct even
++  // if the memo below bails on a stale render.
++  onSelectText?: (messageID: string) => void
++  onEdit?: (messageID: string) => void
+ }
+ 
+ // TODO: Replace with streamdown-rn once React 19 types PR lands - it has
+ // built-in block-level memoization that eliminates re-renders for stable blocks
+ export const MessageBubble = memo(
+-  function MessageBubble({ message, parts, isDark, onLongPress }: Props) {
++  function MessageBubble({ message, parts, isDark, onSelectText, onEdit }: Props) {
+     const isUser = message.role === "user"
+ 
+     const textParts = parts.filter((p) => p.type === "text")
+@@ -36,10 +41,7 @@ export const MessageBubble = memo(
+     const reasoning = reasoningParts.map((p) => p.text).join("\n") || ""
+ 
+     return (
+-      <TouchableOpacity
+-        activeOpacity={isUser && onLongPress ? 0.7 : 1}
+-        onLongPress={isUser && onLongPress ? () => onLongPress(message.id) : undefined}
+-        disabled={!isUser || !onLongPress}
++      <View
+         style={[
+           s.bubble,
+           isUser ? s.user : s.assistant,
+@@ -58,6 +60,39 @@ export const MessageBubble = memo(
+           <Text style={[s.role, isUser && s.roleUser, isDark && s.textWhite]}>{isUser ? "You" : "Assistant"}</Text>
+           {message.model && <Text style={[s.modelTag, isDark && s.modelTagDark]}>{message.model.modelID}</Text>}
+           {!isUser && message.modelID && <Text style={[s.modelTag, isDark && s.modelTagDark]}>{message.modelID}</Text>}
++          {/* Message actions are taps in a right-aligned group at the end of the
++              header row — "Select text" sits immediately left of "Edit". Nothing
++              here is a bubble-wide gesture: a long-press on the bubble competed
++              with horizontal scrolling in code blocks and with text selection.
++              Labels are explicitly non-selectable so a tap can't be swallowed. */}
++          {(onSelectText || onEdit) && (
++            <View style={s.actions}>
++              {onSelectText && hasSelectableContent(parts) && (
++                <TouchableOpacity
++                  style={[s.selectChip, isDark && s.selectChipDark]}
++                  hitSlop={8}
++                  onPress={() => onSelectText(message.id)}
++                  testID={`message-select-text-${message.id}`}
++                >
++                  <Text selectable={false} style={[s.selectChipText, isDark && s.selectChipTextDark]}>
++                    Select text
++                  </Text>
++                </TouchableOpacity>
++              )}
++              {isUser && onEdit && (
++                <TouchableOpacity
++                  style={[s.selectChip, isDark && s.selectChipDark]}
++                  hitSlop={8}
++                  onPress={() => onEdit(message.id)}
++                  testID={`message-edit-${message.id}`}
++                >
++                  <Text selectable={false} style={[s.selectChipText, isDark && s.selectChipTextDark]}>
++                    Edit
++                  </Text>
++                </TouchableOpacity>
++              )}
++            </View>
++          )}
+         </View>
+ 
+         {/* Image attachments */}
+@@ -87,7 +122,10 @@ export const MessageBubble = memo(
+         {/* Message text */}
+         {text.length > 0 &&
+           (isUser ? (
+-            <Text style={[s.messageText, isDark && s.textWhite]} selectable>
++            // Android: inline selection in a list row is unreliable (RN#46999)
++            // and competes with the bubble's long-press, so user text selects
++            // through the "Select text" sheet. iOS has no such conflict.
++            <Text style={[s.messageText, isDark && s.textWhite]} selectable={Platform.OS === "ios"}>
+               {text}
+             </Text>
+           ) : (
+@@ -101,6 +139,18 @@ export const MessageBubble = memo(
+           <ToolCallCard key={tool.id} tool={tool} isDark={isDark} />
+         ))}
+ 
++        {/* Run-level failure (assistant message carries `error` when the agent
++            errored out — provider failure, aborted stream, etc.). Without this
++            an errored run looked identical to a successful one when reading
++            history; the live case is covered by the session error banner. */}
++        {message.error?.message && (
++          <View style={[s.errorBlock, isDark && s.errorBlockDark]}>
++            <Text style={[s.errorBlockText, isDark && s.errorBlockTextDark]} selectable={Platform.OS === "ios"}>
++              {message.error.message}
++            </Text>
++          </View>
++        )}
++
+         {/* Tokens/cost for assistant messages */}
+         {!isUser && message.tokens && (
+           <Text style={[s.tokens, isDark && s.tokensDark]}>
+@@ -108,7 +158,7 @@ export const MessageBubble = memo(
+             {message.cost ? ` · $${message.cost.toFixed(4)}` : ""}
+           </Text>
+         )}
+-      </TouchableOpacity>
++      </View>
+     )
+   },
+   (prev, next) => {
+@@ -120,7 +170,8 @@ export const MessageBubble = memo(
+     // unchanged (completed) messages during other messages' streaming.
+     if (prev.message !== next.message) return false
+     if (prev.isDark !== next.isDark) return false
+-    if (prev.onLongPress !== next.onLongPress) return false
++    if (prev.onSelectText !== next.onSelectText) return false
++    if (prev.onEdit !== next.onEdit) return false
+     if (prev.parts.length !== next.parts.length) return false
+     for (let i = 0; i < prev.parts.length; i++) {
+       if (prev.parts[i] !== next.parts[i]) return false
+@@ -141,6 +192,27 @@ const s = StyleSheet.create({
+   roleUser: { color: "#0a0a0a" },
+   textWhite: { color: "#ffffff" },
+ 
++  actions: {
++    // Pushes the group to the right edge of the header row; the chips inside it
++    // stay adjacent in source order (Select text, then Edit).
++    marginLeft: "auto",
++    flexDirection: "row",
++    alignItems: "center",
++    gap: 6,
++    flexShrink: 0,
++  },
++  selectChip: {
++    paddingHorizontal: 8,
++    paddingVertical: 3,
++    borderRadius: 10,
++    borderWidth: 1,
++    borderColor: "#d4d4d4",
++    flexShrink: 0,
++  },
++  selectChipDark: { borderColor: "#404040" },
++  selectChipText: { fontSize: 11, color: "#525252" },
++  selectChipTextDark: { color: "#d4d4d4" },
++
+   modelTag: {
+     fontSize: 11,
+     color: "#999999",
+@@ -158,6 +230,19 @@ const s = StyleSheet.create({
+   tokens: { fontSize: 11, color: "#999999", marginTop: 8 },
+   tokensDark: { color: "#666666" },
+ 
++  // Run-level error block inside an assistant bubble
++  errorBlock: {
++    marginTop: 8,
++    padding: 10,
++    borderRadius: 8,
++    backgroundColor: "#fef2f2",
++    borderWidth: 1,
++    borderColor: "#fecaca",
++  },
++  errorBlockDark: { backgroundColor: "#3b1212", borderColor: "#7f1d1d" },
++  errorBlockText: { color: "#b91c1c", fontSize: 13 },
++  errorBlockTextDark: { color: "#fca5a5" },
++
+   // Images
+   imageScroll: { marginBottom: 8 },
+   imageRow: { gap: 8 },
+diff --git a/src/components/chat/MessageTextSheet.tsx b/src/components/chat/MessageTextSheet.tsx
+new file mode 100644
+index 0000000..9c6069e
+--- /dev/null
++++ b/src/components/chat/MessageTextSheet.tsx
+@@ -0,0 +1,79 @@
++import { useState } from "react"
++import { Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View, useColorScheme } from "react-native"
++import * as Clipboard from "expo-clipboard"
++import { useTranslation } from "react-i18next"
++
++interface Props {
++  visible: boolean
++  text: string
++  onClose: () => void
++}
++
++// Full-screen selectable-text view for a chat message.
++//
++// Why a modal instead of selectable <Text> inside the bubble: markdown text
++// nodes live in rows of the session screen's FlatList, where selectable Text
++// hits the long-standing Android nesting bug (facebook/react-native#46999 —
++// the reason Markdown.tsx drops `selectable` entirely). A plain ScrollView
++// outside any virtualized list lets the platform's native selection
++// (long-press → handles → copy) work reliably on both platforms, and gives a
++// "copy all" fallback for whole-message copying.
++export function MessageTextSheet({ visible, text, onClose }: Props) {
++  const { t } = useTranslation()
++  const isDark = useColorScheme() === "dark"
++  const [copied, setCopied] = useState(false)
++
++  const copyAll = async () => {
++    await Clipboard.setStringAsync(text)
++    setCopied(true)
++    setTimeout(() => setCopied(false), 2000)
++  }
++
++  return (
++    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
++      <View style={[s.container, isDark && s.containerDark]}>
++        <View style={[s.header, isDark && s.headerDark]}>
++          <Text style={[s.title, isDark && s.textWhite]}>{t("session.actions.selectText")}</Text>
++          <TouchableOpacity onPress={copyAll} style={[s.copyBtn, isDark && s.copyBtnDark]} testID="text-sheet-copy">
++            <Text style={[s.copyText, isDark && s.copyTextDark]}>{copied ? t("session.actions.copied") : t("session.actions.copyAll")}</Text>
++          </TouchableOpacity>
++          <TouchableOpacity onPress={onClose} style={s.closeBtn} testID="text-sheet-close">
++            <Text style={[s.closeText, isDark && s.closeTextDark]}>{t("common.close")}</Text>
++          </TouchableOpacity>
++        </View>
++        <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator>
++          <Text style={[s.body, isDark && s.textWhite]} selectable>
++            {text}
++          </Text>
++        </ScrollView>
++      </View>
++    </Modal>
++  )
++}
++
++const s = StyleSheet.create({
++  container: { flex: 1, backgroundColor: "#fafafa" },
++  containerDark: { backgroundColor: "#111111" },
++  header: {
++    flexDirection: "row",
++    alignItems: "center",
++    gap: 12,
++    paddingHorizontal: 16,
++    paddingTop: 60,
++    paddingBottom: 12,
++    borderBottomWidth: 1,
++    borderBottomColor: "#e5e5e5",
++  },
++  headerDark: { borderBottomColor: "#2a2a2a" },
++  title: { flex: 1, fontSize: 16, fontWeight: "600", color: "#0a0a0a" },
++  textWhite: { color: "#ffffff" },
++  copyBtn: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: "#e8e5f0", borderRadius: 8 },
++  copyBtnDark: { backgroundColor: "#2a2040" },
++  copyText: { color: "#6d28d9", fontSize: 13, fontWeight: "600" },
++  copyTextDark: { color: "#c4b5fd" },
++  closeBtn: { paddingHorizontal: 10, paddingVertical: 6 },
++  closeText: { color: "#666666", fontSize: 13 },
++  closeTextDark: { color: "#888888" },
++  scroll: { padding: 16 },
++  body: { fontSize: 15, lineHeight: 23, color: "#0a0a0a" },
++})
+diff --git a/src/components/chat/index.ts b/src/components/chat/index.ts
+index 4df6472..b22b3d3 100644
+--- a/src/components/chat/index.ts
++++ b/src/components/chat/index.ts
+@@ -12,3 +12,4 @@ export { ImageAttachments, type Attachment } from "./ImageAttachments"
+ export { DirectorySwitcher } from "./DirectorySwitcher"
+ export { DirectoryBrowserSheet } from "./DirectoryBrowserSheet"
+ export { SessionInfo } from "./SessionInfo"
++export { MessageTextSheet } from "./MessageTextSheet"
+diff --git a/src/components/markdown/CodeBlock.tsx b/src/components/markdown/CodeBlock.tsx
+index 8265309..37080f5 100644
+--- a/src/components/markdown/CodeBlock.tsx
++++ b/src/components/markdown/CodeBlock.tsx
+@@ -1,7 +1,7 @@
+ import { useState } from "react"
+-import { View, Text, TouchableOpacity, StyleSheet, useColorScheme, Platform, ScrollView } from "react-native"
++import { View, Text, TouchableOpacity, StyleSheet, useColorScheme, Platform } from "react-native"
+ import * as Clipboard from "expo-clipboard"
+-import { WIDE_CONTENT_SCROLL_CONFIG } from "../../lib/scroll-config"
++import { wideTextSelection } from "../../lib/scroll-config"
+ 
+ interface Props {
+   code: string
+@@ -11,6 +11,15 @@ interface Props {
+ export function CodeBlock({ code, language }: Props) {
+   const isDark = useColorScheme() === "dark"
+   const [copied, setCopied] = useState(false)
++  const sel = wideTextSelection(Platform.OS)
++
++  // Cosmetic wrapping: one Text per logical line, so indentation survives and a
++  // long line folds inside the block instead of needing sideways scrolling.
++  // The clipboard gets `code` — the raw string from the server — so what you
++  // paste is byte-identical to what was sent, line breaks and all. Wrapping only
++  // exists in the rendering. See ../../lib/scroll-config for why these blocks no
++  // longer scroll horizontally.
++  const lines = code.split("\n")
+ 
+   const copy = async () => {
+     try {
+@@ -28,11 +37,15 @@ export function CodeBlock({ code, language }: Props) {
+           <Text style={[styles.copyBtn, isDark && styles.copyBtnDark]}>{copied ? "Copied!" : "Copy"}</Text>
+         </TouchableOpacity>
+       </View>
+-      <ScrollView {...WIDE_CONTENT_SCROLL_CONFIG} testID="code-block-scroll" contentContainerStyle={styles.codeScroll}>
+-        <Text style={[styles.code, isDark && styles.codeDark]} selectable>
+-          {code}
+-        </Text>
+-      </ScrollView>
++      <View style={styles.codeBody} testID="code-block-body">
++        {lines.map((line, idx) => (
++          // An empty Text collapses to zero height, which would eat blank lines
++          // and make pasted-vs-displayed line counts disagree.
++          <Text key={idx} style={[styles.code, isDark && styles.codeDark]} selectable={sel.selectable}>
++            {line.length > 0 ? line : " "}
++          </Text>
++        ))}
++      </View>
+     </View>
+   )
+ }
+@@ -75,7 +88,7 @@ const styles = StyleSheet.create({
+   copyBtnDark: {
+     color: "#a78bfa",
+   },
+-  codeScroll: {
++  codeBody: {
+     padding: 12,
+   },
+   code: {
+diff --git a/src/components/message-bubble-selection.regression.test.ts b/src/components/message-bubble-selection.regression.test.ts
+new file mode 100644
+index 0000000..1c71703
+--- /dev/null
++++ b/src/components/message-bubble-selection.regression.test.ts
+@@ -0,0 +1,94 @@
++import { test } from "node:test"
++import assert from "node:assert/strict"
++import { readFileSync } from "node:fs"
++import { fileURLToPath } from "node:url"
++import path from "node:path"
++
++// Same approach as wide-content-scroll.regression.test.ts: this repo's test
++// runtime is node:test with no React Native renderer, so assert on the real
++// component source instead of skipping component-level coverage.
++//
++// The reported regression: dragging sideways inside a code block selected the
++// message instead of scrolling it, and holding a message popped a menu. Both
++// came from the bubble being a touchable: upstream long-pressed USER bubbles
++// only (for Edit), selection support widened that to every bubble, and a slow
++// horizontal drag inside a bubble stays inside its bounds — so the touchable
++// keeps the press. Message actions are now buttons in the header row and the
++// bubble itself is a plain View with no press handling at all.
++
++const here = path.dirname(fileURLToPath(import.meta.url))
++const read = (rel: string) => readFileSync(path.join(here, rel), "utf8")
++
++test("the bubble has no press or long-press of its own", () => {
++  const src = read("chat/MessageBubble.tsx")
++  assert.match(src, /<View\s+style=\{\[\s+s\.bubble,/)
++  assert.doesNotMatch(src, /onLongPress/, "holding a message must not pop anything")
++  assert.doesNotMatch(src, /activeOpacity/, "the bubble is not a touchable")
++  assert.doesNotMatch(src, /<TouchableOpacity\s+[^>]*style=\{\[\s+s\.bubble/, "the bubble must be a plain View")
++  assert.doesNotMatch(src, /onPress=\{onLongPress|handleMessageLongPress/, "no long-press handler left")
++})
++
++test("both roles get header buttons, adjacent and right-aligned", () => {
++  const src = read("chat/MessageBubble.tsx")
++  assert.match(src, /onSelectText\?: \(messageID: string\) => void/)
++  assert.match(src, /onEdit\?: \(messageID: string\) => void/)
++  assert.match(src, /\{onSelectText && hasSelectableContent\(parts\) && \(/)
++  assert.match(src, /\{isUser && onEdit && \(/)
++  assert.match(src, /testID=\{`message-select-text-\$\{message\.id\}`\}/)
++  assert.match(src, /testID=\{`message-edit-\$\{message\.id\}`\}/)
++  assert.match(src, /onPress=\{\(\) => onSelectText\(message\.id\)\}/)
++  assert.match(src, /onPress=\{\(\) => onEdit\(message\.id\)\}/)
++
++  // "Select text" sits immediately left of "Edit": source order inside one
++  // group, and the group (not each chip) owns the right-alignment.
++  assert.ok(
++    src.indexOf("message-select-text") < src.indexOf("message-edit"),
++    "Select text must precede Edit in the group",
++  )
++  assert.match(src, /<View style=\{s\.actions\}>/)
++  const groupStyle = src.slice(src.indexOf("actions: {"), src.indexOf("selectChip: {"))
++  assert.ok(groupStyle.includes('marginLeft: "auto"'), "the group is pushed to the right edge")
++  assert.ok(groupStyle.includes('flexDirection: "row"') && groupStyle.includes("gap: 6"), "chips sit in one row")
++  assert.ok(groupStyle.includes("flexShrink: 0"), "the chips must not be squeezed out by a long model tag")
++  const chipStyle = src.slice(src.indexOf("selectChip: {"), src.indexOf("selectChipDark:"))
++  assert.ok(!chipStyle.includes("marginLeft"), "chips stay adjacent; the group aligns them")
++
++  // A button label that is itself selectable text is how a tap turns into a
++  // selection instead of an action.
++  const chipLabels = src.split("\n").filter((line) => /<Text selectable/.test(line))
++  assert.equal(chipLabels.length, 2, "both chips render a label")
++  for (const line of chipLabels) {
++    assert.ok(line.includes("selectable={false}"), line)
++    assert.ok(line.includes("s.selectChipText"), line)
++  }
++  // Controls belong in the header row: anything competing with a drag is how
++  // this bug arrived the first time.
++  assert.ok(src.indexOf("message-select-text") < src.indexOf("{/* Image attachments */}"))
++})
++
++test("message text is not inline-selectable on Android", () => {
++  const src = read("chat/MessageBubble.tsx")
++  assert.match(src, /selectable=\{Platform\.OS === "ios"\}/)
++  // No always-on selectable anywhere in the bubble body.
++  const code = src
++    .split("\n")
++    .filter((line) => !line.trim().startsWith("//"))
++    .join("\n")
++    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "") // JSX block comments mention selection
++    .replaceAll('selectable={Platform.OS === "ios"}', "")
++    .replaceAll("selectable={false}", "")
++  assert.ok(!code.includes("selectable"), "bubble text selects only through the sheet on Android")
++})
++
++test("the session screen wires the buttons to single-implementation handlers", () => {
++  const src = readFileSync(path.join(here, "..", "..", "app", "session", "[id].tsx"), "utf8")
++  assert.match(src, /onSelectText=\{openSelectTextSheet\}/)
++  assert.match(src, /onEdit=\{startEditFlow\}/)
++  assert.doesNotMatch(src, /handleMessageLongPress/, "the long-press action sheet is gone")
++  assert.doesNotMatch(src, /type AlertButton/, "unused with the sheet removed")
++  assert.doesNotMatch(src, /import \{ hasSelectableContent, messagePartsToSelectableText \}/)
++  // No half-migrated leftover: the sheet text and the revert flow each live in
++  // exactly one place, shared by the buttons.
++  assert.doesNotMatch(src, /setTextSheet\(sheetText\)/)
++  assert.equal(src.split("revertToMessage(").length - 1, 1, "the revert flow must exist once, in startEditFlow")
++})
+diff --git a/src/components/wide-content-scroll.regression.test.ts b/src/components/wide-content-scroll.regression.test.ts
+deleted file mode 100644
+index 3e0edcd..0000000
+--- a/src/components/wide-content-scroll.regression.test.ts
++++ /dev/null
+@@ -1,45 +0,0 @@
+-import { test } from "node:test"
+-import assert from "node:assert/strict"
+-import { readFileSync } from "node:fs"
+-import { fileURLToPath } from "node:url"
+-import path from "node:path"
+-
+-// GitHub issue #21 ("QA: verify DiffView + CodeBlock horizontal-scroll
+-// on-device with a populated diff"). The underlying fixes were:
+-//   - src/components/chat/DiffView.tsx: wrap diff lines in a horizontal
+-//     ScrollView (previously truncated with numberOfLines={1}).
+-//   - src/components/markdown/CodeBlock.tsx: wrap code in a horizontal
+-//     ScrollView (previously long lines wrapped/mangled).
+-//
+-// This repo's runtime is React Native, so these components can't be rendered
+-// with node:test (no react-test-renderer / RN jest preset is set up here —
+-// see package.json's "test" script, which only globs plain .test.ts files).
+-// Instead of skipping component-level coverage, this test reads the actual
+-// .tsx source and asserts on its structure: it's a plain-text/regex check,
+-// but it directly targets the two markers that would prove a regression —
+-// (a) the ScrollView wiring, (b) reintroducing line-truncation — so it can't
+-// pass on a source file where the fix was reverted.
+-
+-function readComponent(relativePath: string): string {
+-  const dir = path.dirname(fileURLToPath(import.meta.url))
+-  return readFileSync(path.join(dir, relativePath), "utf8")
+-}
+-
+-test("DiffView wraps diff lines in the shared horizontal-scroll ScrollView", () => {
+-  const src = readComponent("chat/DiffView.tsx")
+-  assert.match(src, /<ScrollView\s+\{\.\.\.WIDE_CONTENT_SCROLL_CONFIG\}/)
+-  assert.doesNotMatch(src, /numberOfLines/, "DiffView must not truncate diff line text with numberOfLines")
+-})
+-
+-test("CodeBlock wraps code in the shared horizontal-scroll ScrollView", () => {
+-  const src = readComponent("markdown/CodeBlock.tsx")
+-  assert.match(src, /<ScrollView\s+\{\.\.\.WIDE_CONTENT_SCROLL_CONFIG\}/)
+-  assert.doesNotMatch(src, /numberOfLines/, "CodeBlock must not truncate code text with numberOfLines")
+-})
+-
+-test("DiffView and CodeBlock both source the config from the shared, unit-tested module", () => {
+-  const diffView = readComponent("chat/DiffView.tsx")
+-  const codeBlock = readComponent("markdown/CodeBlock.tsx")
+-  assert.match(diffView, /from ["']\.\.\/\.\.\/lib\/scroll-config["']/)
+-  assert.match(codeBlock, /from ["']\.\.\/\.\.\/lib\/scroll-config["']/)
+-})
+diff --git a/src/components/wide-content-wrap.regression.test.ts b/src/components/wide-content-wrap.regression.test.ts
+new file mode 100644
+index 0000000..1fb9cb9
+--- /dev/null
++++ b/src/components/wide-content-wrap.regression.test.ts
+@@ -0,0 +1,82 @@
++import { test } from "node:test"
++import assert from "node:assert/strict"
++import { readFileSync } from "node:fs"
++import { fileURLToPath } from "node:url"
++import path from "node:path"
++
++// GitHub issue #21 ("QA: verify DiffView + CodeBlock horizontal-scroll on-device
++// with a populated diff") was about wide lines being TRUNCATED. The original fix
++// was a horizontal ScrollView, which on a phone became a gesture fight against the
++// vertical message list (see src/lib/scroll-config.ts); both components now wrap
++// wide lines instead. What has to stay true is the original requirement plus the
++// copy guarantee:
++//   (a) no numberOfLines / ellipsizeMode truncation in either component
++//   (b) no horizontal scroll container reintroduced — that is the gesture bug
++//   (c) CodeBlock copies the raw `code`, never the wrapped rendering
++//
++// This repo's runtime is React Native, so these components can't be rendered with
++// node:test (no react-test-renderer / RN jest preset — package.json's "test" script
++// only globs plain .test.ts files). Instead of skipping component-level coverage,
++// this test reads the actual .tsx source and asserts on the markers that would
++// prove a regression.
++
++const here = path.dirname(fileURLToPath(import.meta.url))
++const readComponent = (rel: string) => readFileSync(path.join(here, rel), "utf8")
++
++const WIDE_COMPONENTS = ["chat/DiffView.tsx", "markdown/CodeBlock.tsx"]
++
++// The rationale lives in comments, so comments must not be mistaken for code:
++// "numberOfLines", "horizontal" and "selectable" all appear in prose here.
++function codeOnly(src: string) {
++  return src
++    .split("\n")
++    .filter((line) => !line.trim().startsWith("//"))
++    .join("\n")
++    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
++}
++
++test("wide content is never truncated", () => {
++  for (const rel of WIDE_COMPONENTS) {
++    const code = codeOnly(readComponent(rel))
++    assert.doesNotMatch(code, /numberOfLines/, `${rel} must not truncate wide lines (issue #21)`)
++    assert.doesNotMatch(code, /ellipsizeMode/, `${rel} must not ellipsize wide lines (issue #21)`)
++  }
++})
++
++test("wide content wraps instead of scrolling sideways", () => {
++  for (const rel of WIDE_COMPONENTS) {
++    const code = codeOnly(readComponent(rel))
++    assert.doesNotMatch(code, /ScrollView/, `${rel} must wrap wide lines, not scroll them sideways`)
++    assert.doesNotMatch(code, /horizontal/, `${rel} must not reintroduce a horizontal scroll container`)
++  }
++})
++
++test("every logical line is rendered, so indentation and blank lines survive", () => {
++  const codeBlock = readComponent("markdown/CodeBlock.tsx")
++  assert.ok(codeBlock.includes('code.split("\\n")'), "CodeBlock must render one Text per logical line")
++  assert.ok(codeBlock.includes('line.length > 0 ? line : " "'), "CodeBlock must keep blank lines visible")
++
++  const diffView = readComponent("chat/DiffView.tsx")
++  assert.ok(diffView.includes('line.text.length > 0 ? line.text : " "'), "DiffView must keep blank diff lines visible")
++  const textStyle = diffView.slice(diffView.indexOf("  text: {"))
++  assert.ok(textStyle.slice(0, 240).includes("flex: 1"), "DiffView text must be flex:1 so the fold happens inside the row")
++})
++
++test("copying a code block copies the raw string, not the wrapped rendering", () => {
++  const src = readComponent("markdown/CodeBlock.tsx")
++  assert.ok(src.includes("Clipboard.setStringAsync(code)"), "Copy must hand the clipboard the untouched code")
++  const code = codeOnly(src)
++  const writes = code.match(/setStringAsync\([^)]*\)/g) || []
++  assert.equal(writes.length, 1, "exactly one clipboard write, from the Copy button")
++  assert.equal(writes[0], "setStringAsync(code)", "the clipboard must receive the untouched string")
++})
++
++test("both components gate selection through the shared, unit-tested helper", () => {
++  for (const rel of WIDE_COMPONENTS) {
++    const src = readComponent(rel)
++    assert.ok(src.includes("wideTextSelection(Platform.OS)"), rel)
++    assert.ok(src.includes("selectable={sel.selectable}"), rel)
++    const code = codeOnly(src).replaceAll("selectable={sel.selectable}", "").replaceAll("sel.selectable", "")
++    assert.ok(!code.includes("selectable"), `${rel} must not enable selection outside wideTextSelection`)
++  }
++})
+diff --git a/src/lib/api-detect.test.ts b/src/lib/api-detect.test.ts
+new file mode 100644
+index 0000000..6c7d549
+--- /dev/null
++++ b/src/lib/api-detect.test.ts
+@@ -0,0 +1,81 @@
++import assert from "node:assert/strict"
++import { test } from "node:test"
++
++import { detectServerApi, isLegacyApi, type ProbeResponse } from "./api-detect.ts"
++
++// Every fixture below is a real response recorded on 2026-09-24 from a live server:
++// opencode v2.0.16 (100.77.13.76:4096) and opencode 1.18.32 (`opencode serve`).
++const SPA_HTML =
++  '<!doctype html> <html lang="en" style="background-color: var(--v2-background-bg-deep, #fafafa)"> <head>'
++
++function probe(responses: Record<string, ProbeResponse>) {
++  return async (path: string): Promise<ProbeResponse> => {
++    const found = responses[path]
++    if (!found) throw new Error(`probe not stubbed: ${path}`)
++    return found
++  }
++}
++
++test("detectServerApi reads a v2 server from its JSON /api/info", async () => {
++  const identity = await detectServerApi(
++    probe({
++      "/api/info": {
++        status: 200,
++        contentType: "application/json",
++        body: JSON.stringify({ version: "2.0.16", pid: 2967, urls: ["http://100.77.13.76:4096"] }),
++      },
++    }),
++  )
++  assert.deepEqual(identity, { api: "v2", version: "2.0.16" })
++})
++
++test("detectServerApi still classifies v2 when /api/info only answers 401", async () => {
++  // Recorded unauthenticated against v2.0.16: the route exists and demands a password,
++  // while every v1 route on the same host falls through to the SPA.
++  const identity = await detectServerApi(
++    probe({
++      "/api/info": { status: 401, contentType: "", body: "" },
++    }),
++  )
++  assert.deepEqual(identity, { api: "v2" })
++})
++
++test("detectServerApi falls back to /global/health for a v1 server", async () => {
++  // Recorded against 1.18.32: /api/info is not a route there, so it serves the SPA
++  // with a 200. Treating that 200 as a healthy v2 connection is the bug this guards.
++  const identity = await detectServerApi(
++    probe({
++      "/api/info": { status: 200, contentType: "text/html", body: SPA_HTML },
++      "/global/health": { status: 200, contentType: "application/json", body: '{"healthy":true,"version":"1.18.32"}' },
++    }),
++  )
++  assert.deepEqual(identity, { api: "v1", version: "1.18.32" })
++})
++
++test("detectServerApi classifies v1 when health demands a password", async () => {
++  const identity = await detectServerApi(
++    probe({
++      "/api/info": { status: 200, contentType: "text/html", body: SPA_HTML },
++      "/global/health": { status: 401, contentType: "", body: "" },
++    }),
++  )
++  assert.deepEqual(identity, { api: "v1" })
++})
++
++test("detectServerApi rejects a server that answers HTML everywhere", async () => {
++  await assert.rejects(
++    detectServerApi(
++      probe({
++        "/api/info": { status: 200, contentType: "text/html", body: SPA_HTML },
++        "/global/health": { status: 200, contentType: "text/html", body: SPA_HTML },
++      }),
++    ),
++    /neither \/api\/info \(v2\) nor \/global\/health \(v1\)/,
++  )
++})
++
++test("isLegacyApi only reports v1", () => {
++  assert.equal(isLegacyApi("v1"), true)
++  assert.equal(isLegacyApi("v2"), false)
++  assert.equal(isLegacyApi(undefined), false)
++})
+diff --git a/src/lib/api-detect.ts b/src/lib/api-detect.ts
+new file mode 100644
+index 0000000..499fab2
+--- /dev/null
++++ b/src/lib/api-detect.ts
+@@ -0,0 +1,80 @@
++// Decide which server API a connection speaks, from the response envelope alone.
++//
++// Verified against live servers on 2026-09-24:
++//   opencode v2.0.16   GET /api/info       -> 401 (route exists, auth required)
++//                                          -> 200 application/json when authenticated
++//                      GET /global/health  -> 200 text/html   (SPA fall-through)
++//   opencode 1.18.32   GET /api/info       -> 200 text/html   (SPA fall-through)
++//                      GET /global/health  -> 200 application/json {healthy, version}
++//
++// The discriminator is the content type, never the status code: an unknown route on
++// either server answers 200 with the web SPA's HTML, which is exactly how a v1 server
++// used to pass v2's health check and then fail on every later request.
++//
++// Kept free of expo/fetch so it runs under plain `node --test` (same pattern as
++// api-error.ts / diagnostics-classify.ts).
++export type ServerApi = "v1" | "v2"
++
++export interface ServerIdentity {
++  api: ServerApi
++  version?: string
++}
++
++export interface ProbeResponse {
++  status: number
++  contentType: string
++  body: string
++}
++
++/** Fetch one path and report the envelope. Implemented by sdk.ts with expo/fetch. */
++export type ProbeRequest = (path: string) => Promise<ProbeResponse>
++
++function isJson(contentType: string): boolean {
++  return contentType.includes("application/json")
++}
++
++/** 401/403 means the route exists but wants credentials — a route that does not
++ *  exist would have fallen through to the SPA (200 HTML), so the API is known even
++ *  though the body is not readable. */
++function wantsAuth(status: number): boolean {
++  return status === 401 || status === 403
++}
++
++function versionFrom(body: string): string | undefined {
++  try {
++    const parsed = JSON.parse(body) as { version?: unknown }
++    return typeof parsed.version === "string" ? parsed.version : undefined
++  } catch {
++    return undefined
++  }
++}
++
++/** Classify a server from the two probes. Throws when neither route answers as JSON,
++ *  which means the endpoint is not an opencode server we can talk to. */
++export async function detectServerApi(probe: ProbeRequest): Promise<ServerIdentity> {
++  const info = await probe("/api/info")
++  if (isJson(info.contentType) && info.status < 300) {
++    return { api: "v2", version: versionFrom(info.body) }
++  }
++  if (wantsAuth(info.status)) {
++    return { api: "v2" }
++  }
++
++  const health = await probe("/global/health")
++  if (isJson(health.contentType) && health.status < 300) {
++    return { api: "v1", version: versionFrom(health.body) }
++  }
++  if (wantsAuth(health.status)) {
++    return { api: "v1" }
++  }
++
++  throw new Error(
++    "Unsupported server: neither /api/info (v2) nor /global/health (v1) answered with JSON. " +
++      "This looks like an opencode web page, not a server API.",
++  )
++}
++
++/** True when a detected server is old enough that v2-only affordances must be hidden. */
++export function isLegacyApi(api: ServerApi | undefined): boolean {
++  return api === "v1"
++}
+diff --git a/src/lib/i18n/en.json b/src/lib/i18n/en.json
+index 13519f2..4f3e242 100644
+--- a/src/lib/i18n/en.json
++++ b/src/lib/i18n/en.json
+@@ -6,6 +6,7 @@
+     "delete": "Delete",
+     "retry": "Retry",
+     "save": "Save",
++    "close": "Close",
+     "shareReport": "Share report"
+   },
+   "settings": {
+@@ -81,7 +82,16 @@
+       "reconnecting": "Reconnecting… (attempt {{attempt}})",
+       "connected": "Connected ✓",
+       "reverted": "Message reverted — resend to confirm",
+-      "undo": "Undo"
++      "undo": "Undo",
++      "dismiss": "Dismiss"
++    },
++    "sheet": {
++      "thinking": "Thinking",
++      "tool": "Tool",
++      "input": "Input",
++      "result": "Result",
++      "error": "Error",
++      "file": "File"
+     },
+     "empty": {
+       "title": "Start a conversation",
+@@ -95,7 +105,10 @@
+     },
+     "actions": {
+       "editMessage": "Edit message",
+-      "replace": "Replace"
++      "replace": "Replace",
++      "selectText": "Select text",
++      "copyAll": "Copy all",
++      "copied": "Copied"
+     },
+     "alerts": {
+       "messageActionsTitle": "Message actions",
+diff --git a/src/lib/i18n/zh-Hans.json b/src/lib/i18n/zh-Hans.json
+index 9ba906f..6df27ae 100644
+--- a/src/lib/i18n/zh-Hans.json
++++ b/src/lib/i18n/zh-Hans.json
+@@ -6,6 +6,7 @@
+     "delete": "删除",
+     "retry": "重试",
+     "save": "保存",
++    "close": "关闭",
+     "shareReport": "分享报告"
+   },
+   "settings": {
+@@ -81,7 +82,16 @@
+       "reconnecting": "正在重新连接…（第 {{attempt}} 次尝试）",
+       "connected": "已连接 ✓",
+       "reverted": "消息已撤回 — 重新发送以确认",
+-      "undo": "撤销"
++      "undo": "撤销",
++      "dismiss": "忽略"
++    },
++    "sheet": {
++      "thinking": "思考过程",
++      "tool": "工具",
++      "input": "输入",
++      "result": "结果",
++      "error": "错误",
++      "file": "文件"
+     },
+     "empty": {
+       "title": "开始一段对话",
+@@ -95,7 +105,10 @@
+     },
+     "actions": {
+       "editMessage": "编辑消息",
+-      "replace": "替换"
++      "replace": "替换",
++      "selectText": "选择文本",
++      "copyAll": "复制全部",
++      "copied": "已复制"
+     },
+     "alerts": {
+       "messageActionsTitle": "消息操作",
+diff --git a/src/lib/message-text.test.ts b/src/lib/message-text.test.ts
+new file mode 100644
+index 0000000..790b1ee
+--- /dev/null
++++ b/src/lib/message-text.test.ts
+@@ -0,0 +1,76 @@
++import assert from "node:assert/strict"
++import test from "node:test"
++
++import { hasSelectableContent, messagePartsToSelectableText } from "./message-text.ts"
++
++import type { Part } from "./sdk.ts"
++
++test("flattens text, reasoning and tool parts in order", () => {
++  const parts: Part[] = [
++    { id: "t1", messageID: "m1", type: "text", text: "Working on it." },
++    { id: "r1", messageID: "m1", type: "reasoning", text: "Need to read the file first." },
++    {
++      id: "tool1",
++      messageID: "m1",
++      type: "tool",
++      tool: "read",
++      callID: "call_1",
++      state: { status: "completed", input: { path: "a.ts" }, output: "file contents" },
++    },
++    { id: "t2", messageID: "m1", type: "text", text: "Done." },
++  ]
++
++  const text = messagePartsToSelectableText(parts)
++  assert.equal(
++    text,
++    [
++      "Working on it.",
++      "Thinking:\nNeed to read the file first.",
++      'Tool: read\nInput:\n{\n  "path": "a.ts"\n}\nResult:\nfile contents',
++      "Done.",
++    ].join("\n\n"),
++  )
++})
++
++test("tool errors render as Error blocks", () => {
++  const parts: Part[] = [
++    {
++      id: "tool1",
++      messageID: "m1",
++      type: "tool",
++      tool: "bash",
++      state: { status: "error", input: { command: "exit 1" }, error: { message: "exit code 1" } },
++    },
++  ]
++
++  const text = messagePartsToSelectableText(parts)
++  assert.equal(text, "Tool: bash\nInput:\n{\n  \"command\": \"exit 1\"\n}\nError:\nexit code 1")
++})
++
++test("custom labels are used (i18n)", () => {
++  const parts: Part[] = [{ id: "r1", messageID: "m1", type: "reasoning", text: "hmm" }]
++  const text = messagePartsToSelectableText(parts, {
++    thinking: "思考过程",
++    tool: "工具",
++    input: "输入",
++    result: "结果",
++    error: "错误",
++    file: "文件",
++  })
++  assert.equal(text, "思考过程:\nhmm")
++})
++
++test("empty and non-content parts produce empty text", () => {
++  const parts: Part[] = [
++    { id: "s1", messageID: "m1", type: "step-start" },
++    { id: "t1", messageID: "m1", type: "text", text: "" },
++  ]
++  assert.equal(messagePartsToSelectableText(parts), "")
++  assert.equal(hasSelectableContent(parts), false)
++})
++
++test("hasSelectableContent detects reasoning-only and tool-only messages", () => {
++  assert.equal(hasSelectableContent([{ id: "r", messageID: "m", type: "reasoning", text: "x" }]), true)
++  assert.equal(hasSelectableContent([{ id: "t", messageID: "m", type: "tool", tool: "read" }]), true)
++  assert.equal(hasSelectableContent([{ id: "f", messageID: "m", type: "file", filename: "shot.png" }]), true)
++})
+diff --git a/src/lib/message-text.ts b/src/lib/message-text.ts
+new file mode 100644
+index 0000000..4f1ffb3
+--- /dev/null
++++ b/src/lib/message-text.ts
+@@ -0,0 +1,76 @@
++import type { Part } from "./sdk"
++
++// Plain-text rendering of a message's parts for the full-screen selection
++// sheet. Selection needs a single selectable <Text> (FlatList rows break
++// Android selection — react-native#46999), so every part kind is flattened
++// into one text blob: assistant text verbatim, reasoning under a "Thinking"
++// heading, tool calls as name + input + result/error blocks.
++
++export type SheetLabels = {
++  thinking: string
++  tool: string
++  input: string
++  result: string
++  error: string
++  file: string
++}
++
++const DEFAULT_LABELS: SheetLabels = {
++  thinking: "Thinking",
++  tool: "Tool",
++  input: "Input",
++  result: "Result",
++  error: "Error",
++  file: "File",
++}
++
++function formatValue(value: unknown): string {
++  if (typeof value === "string") return value
++  try {
++    return JSON.stringify(value, null, 2) ?? String(value)
++  } catch {
++    return String(value)
++  }
++}
++
++export function messagePartsToSelectableText(parts: Part[], labels: SheetLabels = DEFAULT_LABELS): string {
++  const blocks: string[] = []
++  for (const part of parts) {
++    if (part.type === "text") {
++      if (part.text) blocks.push(part.text)
++      continue
++    }
++    if (part.type === "reasoning") {
++      if (part.text) blocks.push(`${labels.thinking}:\n${part.text}`)
++      continue
++    }
++    if (part.type === "tool") {
++      const lines = [`${labels.tool}: ${part.tool || part.callID || "unknown"}`]
++      if (part.state?.input !== undefined) {
++        lines.push(`${labels.input}:\n${formatValue(part.state.input)}`)
++      }
++      if (part.state?.status === "error") {
++        lines.push(`${labels.error}:\n${part.state.error?.message || "Tool call failed"}`)
++      } else if (part.state?.output !== undefined) {
++        lines.push(`${labels.result}:\n${formatValue(part.state.output)}`)
++      }
++      blocks.push(lines.join("\n"))
++      continue
++    }
++    if (part.type === "file" && part.filename) {
++      blocks.push(`${labels.file}: ${part.filename}`)
++    }
++  }
++  return blocks.join("\n\n")
++}
++
++// True when a message has any part worth opening the selection sheet for.
++export function hasSelectableContent(parts: Part[]): boolean {
++  return parts.some(
++    (part) =>
++      (part.type === "text" && !!part.text) ||
++      (part.type === "reasoning" && !!part.text) ||
++      part.type === "tool" ||
++      (part.type === "file" && !!part.filename),
++  )
++}
+diff --git a/src/lib/scroll-config.test.ts b/src/lib/scroll-config.test.ts
+index 8e1739e..dc64bba 100644
+--- a/src/lib/scroll-config.test.ts
++++ b/src/lib/scroll-config.test.ts
+@@ -1,26 +1,30 @@
+ import { test } from "node:test"
+ import assert from "node:assert/strict"
+-import { WIDE_CONTENT_SCROLL_CONFIG } from "./scroll-config.ts"
++import { wideTextSelection } from "./scroll-config.ts"
+ 
+-// GitHub issue #21: DiffView + CodeBlock must render wide content in a
+-// horizontally-scrollable container (not wrapped, not truncated). Both
+-// components spread WIDE_CONTENT_SCROLL_CONFIG onto their ScrollView (see
+-// src/components/chat/DiffView.tsx and src/components/markdown/CodeBlock.tsx)
+-// so asserting on this object here is asserting on the actual runtime props,
+-// not a parallel copy that can drift out of sync.
++// wideTextSelection is the single place CodeBlock and DiffView decide whether
++// their text is inline-selectable. See src/lib/scroll-config.ts for the gesture
++// history behind the decision; wide-content-wrap.regression.test.ts is what proves
++// both components actually call this helper rather than keeping a private copy.
+ 
+-test("wide-content scroll config enables horizontal scrolling", () => {
+-  assert.equal(WIDE_CONTENT_SCROLL_CONFIG.horizontal, true)
++test("android gets no inline selection in wide content", () => {
++  assert.deepEqual(wideTextSelection("android"), { selectable: false })
+ })
+ 
+-test("wide-content scroll config shows the horizontal scroll indicator", () => {
+-  // Regression guard: a container that scrolls but hides its indicator is
+-  // easy to mistake for content that simply doesn't overflow. Keep the
+-  // indicator visible so on-device QA (and screenshots) can tell scrollable
+-  // content apart from clipped/truncated content.
+-  assert.equal(WIDE_CONTENT_SCROLL_CONFIG.showsHorizontalScrollIndicator, true)
++test("ios keeps inline selection (no gesture conflict there)", () => {
++  assert.deepEqual(wideTextSelection("ios"), { selectable: true })
+ })
+ 
+-test("wide-content scroll config has no unexpected keys", () => {
+-  assert.deepEqual(Object.keys(WIDE_CONTENT_SCROLL_CONFIG).sort(), ["horizontal", "showsHorizontalScrollIndicator"])
++test("every other platform falls back to non-selectable", () => {
++  for (const platform of ["web", "windows", "macos", "unknown"]) {
++    assert.deepEqual(wideTextSelection(platform), { selectable: false }, platform)
++  }
++})
++
++test("the decision is only about selection", () => {
++  // Wrapping replaced horizontal scrolling, so there is no scroll knob left to
++  // freeze. `scrollEnabled` in this shape is what made the reverted 0.5.6 attempt
++  // trade one bug for a worse one; it must not come back.
++  assert.deepEqual(Object.keys(wideTextSelection("android")), ["selectable"])
++  assert.deepEqual(Object.keys(wideTextSelection("ios")), ["selectable"])
+ })
+diff --git a/src/lib/scroll-config.ts b/src/lib/scroll-config.ts
+index b915ede..f123170 100644
+--- a/src/lib/scroll-config.ts
++++ b/src/lib/scroll-config.ts
+@@ -1,18 +1,35 @@
+-// Pure (no React Native imports) horizontal-scroll configuration shared by
+-// src/components/chat/DiffView.tsx and src/components/markdown/CodeBlock.tsx.
++// Pure (no React Native imports) helpers shared by src/components/chat/DiffView.tsx
++// and src/components/markdown/CodeBlock.tsx. Keeping the one decision these two
++// components make in a plain module means it can be unit-tested with node:test
++// (this repo's test runtime has no React Native renderer) instead of being
++// duplicated in both files.
+ //
+-// GitHub issue #21: wide diff lines and wide code-block lines must render in
+-// a horizontally-scrollable container instead of being wrap-broken or
+-// truncated with `numberOfLines`. Centralizing the actual runtime props in
+-// one plain object lets that decision be unit-tested with node:test (no React
+-// Native renderer needed) while both components spread the SAME object onto
+-// their ScrollView, so the test and the real components can't drift apart.
+-export interface HorizontalScrollConfig {
+-  horizontal: true
+-  showsHorizontalScrollIndicator: boolean
++// Wide content — diff lines and code lines — WRAPS instead of scrolling sideways.
++// The history of that decision is worth keeping, because every earlier attempt at
++// this regressed something else:
++//
++// - Issue #21 was about truncation: wide lines were being cut with numberOfLines.
++//   Wrapping solves that just as a horizontal ScrollView did, without the gesture
++//   problem below. Neither component may reintroduce numberOfLines or ellipsizeMode.
++// - A horizontal ScrollView inside the vertical message list is unreliable on
++//   Android: ReactScrollView extends android.widget.ScrollView
++//   (ReactAndroid/src/main/java/com/facebook/react/views/scroll/ReactScrollView.java:79),
++//   so it only claims a drag it wins on Android's axis test against the enclosing
++//   list — the drag must be horizontally dominant from the first ACTION_MOVE. That
++//   ±45° window is native and no prop widens it: nestedScrollEnabled hands leftover
++//   scroll to the parent, it does not change who claims the gesture. Paging buttons
++//   were the workaround that existed until wrapping made them unnecessary.
++// - `selectable` <Text> competes with horizontal drags (facebook/react-native#24630
++//   family) and is unreliable inside FlatList rows on Android
++//   (facebook/react-native#46999) — the same reason Markdown.tsx renders prose
++//   non-selectable. Selecting message text goes through MessageTextSheet, a plain
++//   ScrollView outside the list. CodeBlock's Copy button copies the raw string, so
++//   cosmetic wrapping never changes what lands on the clipboard.
++export interface WideTextSelection {
++  selectable: boolean
+ }
+ 
+-export const WIDE_CONTENT_SCROLL_CONFIG: HorizontalScrollConfig = {
+-  horizontal: true,
+-  showsHorizontalScrollIndicator: true,
++export function wideTextSelection(platform: string): WideTextSelection {
++  // iOS has no gesture conflict here, so it keeps inline selection.
++  return { selectable: platform === "ios" }
+ }
+diff --git a/src/lib/sdk-v1.ts b/src/lib/sdk-v1.ts
+new file mode 100644
+index 0000000..a52dbd4
+--- /dev/null
++++ b/src/lib/sdk-v1.ts
+@@ -0,0 +1,545 @@
++// Legacy SDK client wrapper for React Native — opencode v1 server API (<= 1.18.x).
++// Restored from the pre-v2 client (origin/main) so the app still works against a
++// v1 server, which is what `npm install -g opencode-ai` installs today (1.18.32).
++//
++// Kept as its own module rather than a set of fallbacks inside sdk.ts: the two
++// APIs differ in routing prefix, list envelopes, SSE payload names and the
++// question/permission endpoints, so mixing them in one request path is where the
++// silent failures come from. sdk.ts probes a connection (api-detect.ts) and hands
++// it this client; the internal shapes this file returns are the same ones
++// v2-shape.ts converts v2 responses into, so stores and screens are unchanged.
++//
++// expo/fetch provides WinterCG-compliant fetch with ReadableStream support for SSE
++import { fetch as expoFetch } from "expo/fetch"
++import { buildRequestHeaders } from "./headers"
++import { SSEParser } from "./sse"
++import { apiErrorFor } from "./api-error"
++import { loadSessionList } from "./session-list"
++import type { FileRoot } from "./file-roots"
++
++export { ApiAuthError, isAuthError } from "./api-error"
++
++export interface ClientConfig {
++  baseUrl: string
++  directory?: string
++  auth?: {
++    username: string
++    password: string
++  }
++}
++
++export interface Session {
++  id: string
++  slug: string
++  projectID: string
++  directory: string
++  parentID?: string
++  title: string
++  version: string
++  share?: { url: string }
++  time: {
++    created: number
++    updated: number
++    compacting?: number
++    archived?: number
++  }
++  summary?: {
++    additions: number
++    deletions: number
++    files: number
++  }
++  // Present while a message (and everything after it) is pending revert —
++  // the server keeps the underlying messages until the next prompt/summarize
++  // call runs cleanup (or the revert is undone via session.unrevert).
++  revert?: {
++    messageID: string
++    partID?: string
++  }
++}
++
++export interface Message {
++  id: string
++  sessionID: string
++  role: "user" | "assistant"
++  parentID?: string
++  time: {
++    created: number
++    completed?: number
++  }
++  // User message fields
++  agent?: string
++  model?: { providerID: string; modelID: string }
++  // Assistant message fields
++  modelID?: string
++  providerID?: string
++  cost?: number
++  tokens?: {
++    input: number
++    output: number
++    reasoning?: number
++    cache?: { read: number; write: number }
++  }
++  error?: { message: string }
++  finish?: string
++}
++
++// API returns messages with parts embedded
++export interface MessageWithParts {
++  info: Message
++  parts: Part[]
++}
++
++export interface Part {
++  id: string
++  sessionID?: string
++  messageID: string
++  type:
++    | "text"
++    | "reasoning"
++    | "tool"
++    | "file"
++    | "snapshot"
++    | "patch"
++    | "step-start"
++    | "step-finish"
++    | "subtask"
++    | "retry"
++    | "compaction"
++    | "agent"
++  // Text / reasoning part
++  text?: string
++  // Tool part
++  tool?: string
++  callID?: string
++  state?: {
++    status: "pending" | "running" | "completed" | "error"
++    input?: unknown
++    output?: unknown
++    title?: string
++    error?: { message: string }
++    time?: { start?: number; end?: number }
++  }
++  // Timing
++  time?: { start?: number; end?: number }
++  // File part
++  mime?: string
++  url?: string
++  filename?: string
++}
++
++export interface Agent {
++  name: string
++  description?: string
++  mode: "subagent" | "primary" | "all"
++  native?: boolean
++  hidden?: boolean
++  topP?: number
++  temperature?: number
++  color?: string
++  model?: { modelID: string; providerID: string }
++  prompt?: string
++  options: Record<string, unknown>
++  steps?: number
++}
++
++export interface Command {
++  name: string
++  description?: string
++  agent?: string
++  model?: string
++  mcp?: boolean
++  template: string
++  subtask?: boolean
++  hints: string[]
++}
++
++export interface Project {
++  id: string
++  name?: string
++  path: {
++    cwd: string
++    root: string
++    absolute: string
++  }
++}
++
++export interface FileEntry {
++  name: string
++  path: string
++  absolute: string
++  type: "file" | "directory"
++  ignored: boolean
++}
++
++export interface Event {
++  type: string
++  properties: Record<string, unknown>
++}
++
++export interface HealthResponse {
++  healthy: boolean
++  version: string
++}
++
++const REQUEST_TIMEOUT_MS = 30_000
++
++// Thrown by request() on a non-2xx response. Carries the HTTP status so
++// callers can distinguish e.g. 404 (older server, endpoint missing) from
++// other failures without parsing the message string.
++export class ApiError extends Error {
++  status: number
++  constructor(status: number, body: string) {
++    super(`API Error: ${status} - ${body}`)
++    this.name = "ApiError"
++    this.status = status
++  }
++}
++
++function createHeaders(config: ClientConfig): HeadersInit {
++  return buildRequestHeaders(config)
++}
++
++// `timeoutMs` lets specific callers (e.g. the onboarding health-check) fail
++// faster than the general REQUEST_TIMEOUT_MS used by real session calls.
++// Leave it unset to get the default.
++async function request<T>(
++  config: ClientConfig,
++  path: string,
++  options: RequestInit = {},
++  timeoutMs?: number,
++): Promise<T> {
++  const url = `${config.baseUrl}${path}`
++  const headers = { ...createHeaders(config), ...options.headers }
++  const response = await fetchWithTimeout(
++    url,
++    {
++      ...options,
++      headers,
++    },
++    timeoutMs,
++  )
++
++  if (!response.ok) {
++    const error = await response.text()
++    throw apiErrorFor(response.status, `API Error: ${response.status} - ${error}`)
++  }
++
++  return response.json()
++}
++
++async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
++  const parentSignal = options.signal
++  if (parentSignal?.aborted) throw new Error("Request aborted")
++
++  const controller = new AbortController()
++  let timedOut = false
++  const timeout = setTimeout(() => {
++    timedOut = true
++    controller.abort()
++  }, timeoutMs)
++  const onParentAbort = () => controller.abort()
++  parentSignal?.addEventListener("abort", onParentAbort)
++
++  try {
++    return await fetch(url, { ...options, signal: controller.signal })
++  } catch (error) {
++    if (timedOut) {
++      throw new Error(`Request timed out after ${timeoutMs}ms`)
++    }
++    throw error
++  } finally {
++    clearTimeout(timeout)
++    parentSignal?.removeEventListener("abort", onParentAbort)
++  }
++}
++
++export function createV1Client(config: ClientConfig) {
++  // Normalize once: a trailing slash on baseUrl (e.g. pasted into Advanced
++  // mode or the Edit screen) would otherwise survive into every
++  // `${config.baseUrl}${path}` concatenation below as a double slash, which
++  // every request then fails against (while the diagnostics probe, which
++  // reconstructs a clean URL, reports "works now"). A bare URL with no
++  // trailing slash is untouched.
++  config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") }
++  return {
++    global: {
++      // `timeoutMs` overrides the default REQUEST_TIMEOUT_MS — used by the
++      // onboarding connection test to fail fast on a bad/unreachable IP
++      // instead of hanging for the full 30s (issue: first-run bounce).
++      health: (timeoutMs?: number) => request<HealthResponse>(config, "/global/health", {}, timeoutMs),
++      // SSE event stream - returns async iterator
++      // Pass an AbortSignal to cancel the connection
++      async *events(signal?: AbortSignal): AsyncGenerator<Event> {
++        const url = `${config.baseUrl}/global/event`
++        const headers = createHeaders(config)
++        // Remove Content-Type for SSE (it's text/event-stream)
++        delete (headers as Record<string, string>)["Content-Type"]
++
++        // Must use expo/fetch for ReadableStream support on native
++        const response = await expoFetch(url, { headers, signal })
++        if (!response.ok || !response.body) {
++          throw apiErrorFor(response.status, `Failed to connect to event stream: ${response.status}`)
++        }
++
++        const reader = response.body.getReader()
++        const decoder = new TextDecoder()
++        const parser = new SSEParser()
++
++        let receivedFirstByte = false
++        try {
++          while (true) {
++            const { done, value } = await reader.read()
++            if (done) {
++              console.log("[SSE] stream ended")
++              break
++            }
++
++            if (!receivedFirstByte) {
++              receivedFirstByte = true
++              console.log(`[SSE] first byte received (${value?.byteLength ?? 0} bytes)`)
++            }
++
++            for (const data of parser.push(decoder.decode(value, { stream: true }))) {
++              try {
++                yield JSON.parse(data)
++              } catch (err) {
++                console.warn("[SSE] Failed to parse event", {
++                  length: data.length,
++                  error: err instanceof Error ? err.message : String(err),
++                })
++              }
++            }
++          }
++        } finally {
++          reader.releaseLock()
++        }
++      },
++    },
++
++    project: {
++      list: () => request<Project[]>(config, "/project"),
++      current: () => request<Project>(config, "/project/current"),
++    },
++
++    // Server-side filesystem browsing, scoped to this client's directory
++    // (see ClientConfig.directory / x-opencode-directory header). Use
++    // clientForDirectory(dir) to get a client rooted at a specific folder,
++    // then list("." ) to enumerate its immediate children.
++    file: {
++      list: (params: { path?: string } = {}) => {
++        const query = new URLSearchParams({ path: params.path ?? "." })
++        return request<FileEntry[]>(config, `/file?${query.toString()}`)
++      },
++      // Enumerate the server's filesystem roots (mounted drives, home dir)
++      // to seed the directory browser's pinned top-level entries. Resolves
++      // to null on servers that don't yet expose GET /file/roots (older
++      // opencode builds) so callers fall back to manual path entry instead
++      // of crashing; other errors propagate like any other request.
++      roots: async (): Promise<FileRoot[] | null> => {
++        try {
++          return await request<FileRoot[]>(config, "/file/roots")
++        } catch (err) {
++          if (err instanceof ApiError && err.status === 404) return null
++          throw err
++        }
++      },
++    },
++
++    path: {
++      get: () =>
++        request<{ home: string; state: string; config: string; worktree: string; directory: string }>(config, "/path"),
++    },
++
++    session: {
++      // Prefer the GLOBAL experimental endpoint (all sessions across every
++      // directory) so the Recent Sessions list works without the user first
++      // picking a folder — a directory-less GET /session is directory-scoped
++      // and returns [] on servers whose active dir has no sessions. Shaping
++      // (roots filter, search, sort-by-updated, limit) happens client-side in
++      // loadSessionList; we fetch /experimental/session with no query params
++      // because the server applies `limit` before we can filter to roots.
++      // Falls back to the legacy /session path only on 404 (older servers).
++      list: (params?: { roots?: boolean; limit?: number; search?: string }): Promise<Session[]> =>
++        loadSessionList(
++          {
++            getExperimental: async (): Promise<Session[] | null> => {
++              const response = await fetchWithTimeout(`${config.baseUrl}/experimental/session`, {
++                headers: createHeaders(config),
++              })
++              // Older servers lack this route — signal fallback to legacy /session.
++              if (response.status === 404) return null
++              if (!response.ok) {
++                const body = await response.text()
++                throw apiErrorFor(response.status, `API Error: ${response.status} - ${body}`)
++              }
++              return response.json()
++            },
++            getLegacy: (query) => request<Session[]>(config, `/session${query}`),
++          },
++          params,
++        ),
++
++      get: (sessionID: string) => request<Session>(config, `/session/${sessionID}`),
++
++      create: (params?: { title?: string }) =>
++        request<Session>(config, "/session", {
++          method: "POST",
++          body: JSON.stringify(params || {}),
++        }),
++
++      delete: (sessionID: string) => request<void>(config, `/session/${sessionID}`, { method: "DELETE" }),
++
++      update: (sessionID: string, params: { title?: string; time?: { archived?: number } }) =>
++        request<Session>(config, `/session/${sessionID}`, {
++          method: "PATCH",
++          body: JSON.stringify(params),
++        }),
++
++      messages: (sessionID: string, params?: { limit?: number }) => {
++        const query = new URLSearchParams()
++        if (params?.limit) query.set("limit", String(params.limit))
++        const qs = query.toString()
++        return request<MessageWithParts[]>(config, `/session/${sessionID}/message${qs ? `?${qs}` : ""}`)
++      },
++
++      // Sends a message and returns the response
++      // Fire-and-forget async prompt - SSE events drive all real-time updates
++      prompt: async (
++        sessionID: string,
++        params: {
++          parts: Array<{ type: "text"; text: string } | { type: "file"; mime: string; url: string; filename?: string }>
++          model?: { providerID: string; modelID: string }
++          agent?: string
++          variant?: string
++        },
++      ): Promise<void> => {
++        const url = `${config.baseUrl}/session/${sessionID}/prompt_async`
++        const headers = createHeaders(config)
++        const body = JSON.stringify(params)
++        const response = await fetchWithTimeout(url, {
++          method: "POST",
++          headers,
++          body,
++        })
++
++        if (!response.ok) {
++          const error = await response.text()
++          throw new Error(`Failed to send message: ${response.status} - ${error}`)
++        }
++      },
++
++      command: async (
++        sessionID: string,
++        params: {
++          command: string
++          arguments: string
++          agent?: string
++          model?: string
++          variant?: string
++          parts?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
++        },
++      ): Promise<void> => {
++        const url = `${config.baseUrl}/session/${sessionID}/command`
++        const headers = createHeaders(config)
++
++        const response = await fetchWithTimeout(url, {
++          method: "POST",
++          headers,
++          body: JSON.stringify({ ...params, sessionID }),
++        })
++
++        if (!response.ok) {
++          const error = await response.text()
++          throw new Error(`Failed to run command: ${response.status} - ${error}`)
++        }
++      },
++
++      abort: (sessionID: string) => request<boolean>(config, `/session/${sessionID}/abort`, { method: "POST" }),
++
++      diff: (sessionID: string, messageID?: string) => {
++        const qs = messageID ? `?messageID=${messageID}` : ""
++        return request<unknown[]>(config, `/session/${sessionID}/diff${qs}`)
++      },
++
++      // Marks messageID (and everything after it) as pending revert. The
++      // underlying messages aren't deleted until the next prompt runs
++      // cleanup, or the revert is undone with unrevert() below.
++      revert: (sessionID: string, messageID: string, partID?: string) =>
++        request<Session>(config, `/session/${sessionID}/revert`, {
++          method: "POST",
++          body: JSON.stringify(partID ? { messageID, partID } : { messageID }),
++        }),
++
++      unrevert: (sessionID: string) =>
++        request<Session>(config, `/session/${sessionID}/unrevert`, {
++          method: "POST",
++        }),
++    },
++
++    permission: {
++      list: () =>
++        request<Array<{ id: string; sessionID: string; tool: string; input: unknown }>>(config, "/permission"),
++
++      reply: (requestID: string, reply: "once" | "always" | "reject") =>
++        request<boolean>(config, `/permission/${requestID}/reply`, {
++          method: "POST",
++          body: JSON.stringify({ reply }),
++        }),
++    },
++
++    question: {
++      list: () => request<Array<{ id: string; sessionID: string; questions: unknown[] }>>(config, "/question"),
++
++      reply: (requestID: string, answers: string[][]) =>
++        request<boolean>(config, `/question/${requestID}/reply`, {
++          method: "POST",
++          body: JSON.stringify({ answers }),
++        }),
++
++      reject: (requestID: string) =>
++        request<boolean>(config, `/question/${requestID}/reject`, {
++          method: "POST",
++        }),
++    },
++
++    agent: {
++      list: () => request<Agent[]>(config, "/agent"),
++    },
++
++    command: {
++      list: () => request<Command[]>(config, "/command"),
++    },
++
++    provider: {
++      list: () =>
++        request<{
++          all: Array<{
++            id: string
++            name: string
++            models: Record<
++              string,
++              {
++                id: string
++                name: string
++                attachment: boolean
++                reasoning: boolean
++                tool_call: boolean
++                cost?: { input: number; output: number }
++                limit: { context: number; output: number }
++                status?: "alpha" | "beta" | "deprecated" | "active"
++                variants?: Record<string, { reasoningEffort?: string }>
++              }
++            >
++          }>
++          default: Record<string, string>
++          connected: string[]
++        }>(config, "/provider"),
++    },
++
++    config: {
++      get: () => request<unknown>(config, "/config"),
++    },
++  }
++}
++
++export type V1Client = ReturnType<typeof createV1Client>
+diff --git a/src/lib/sdk.ts b/src/lib/sdk.ts
+index 89ffb68..88bba1e 100644
+--- a/src/lib/sdk.ts
++++ b/src/lib/sdk.ts
+@@ -1,13 +1,50 @@
+-// SDK client wrapper for React Native
++// SDK client wrapper for React Native — opencode v2 server API.
+ // We create our own lightweight client that mirrors the opencode SDK patterns
+ // but works in React Native environment
+ // expo/fetch provides WinterCG-compliant fetch with ReadableStream support for SSE
++//
++// v2 notes (see docs/v2-api-map.md): every endpoint lives under /api/, list
++// responses are {data, cursor} envelopes, SSE emits typed execution events,
++// and location scoping travels as a `location[directory]` query param (the
++// legacy x-opencode-directory header still works, so headers.ts is unchanged).
++// All v2 -> internal-shape conversion lives in v2-shape.ts so it stays
++// unit-testable outside RN.
+ import { fetch as expoFetch } from "expo/fetch"
+ import { buildRequestHeaders } from "./headers"
+ import { SSEParser } from "./sse"
+-import { apiErrorFor } from "./api-error"
++import { apiErrorFor, isAuthStatus } from "./api-error"
+ import { loadSessionList } from "./session-list"
+ import type { FileRoot } from "./file-roots"
++import { createV1Client } from "./sdk-v1"
++import { detectServerApi, type ProbeRequest, type ServerApi, type ServerIdentity } from "./api-detect"
++import {
++  formAnswerFromFields,
++  pendingRequestInfo,
++  rememberForm,
++  rememberPermissionRequest,
++  toAgent,
++  toCommand,
++  toFileEntries,
++  toMessageWithParts,
++  toPermissionRequest,
++  toProject,
++  toProviderCatalog,
++  toQuestionRequest,
++  toSession,
++  V2EventTranslator,
++  type V2AgentInfo,
++  type V2CommandInfo,
++  type V2FormInfo,
++  type V2FsEntry,
++  type V2LocationRef,
++  type V2Message,
++  type V2ModelInfo,
++  type V2PermissionRequest,
++  type V2ProjectInfo,
++  type V2ProviderInfo,
++  type V2RawEvent,
++  type V2SessionInfo,
++} from "./v2-shape"
+ 
+ export { ApiAuthError, isAuthError } from "./api-error"
+ 
+@@ -18,6 +55,11 @@ export interface ClientConfig {
+     username: string
+     password: string
+   }
++  // Which server API this connection speaks, as recorded by probeServer().
++  // Omitted means "v2" (today's behaviour); "v1" routes to the legacy client in
++  // sdk-v1.ts, which speaks the pre-1.19 routes (/session, /global/event,
++  // /question, /permission) that the v2 server no longer serves.
++  api?: ServerApi
+ }
+ 
+ export interface Session {
+@@ -41,8 +83,8 @@ export interface Session {
+     files: number
+   }
+   // Present while a message (and everything after it) is pending revert —
+-  // the server keeps the underlying messages until the next prompt/summarize
+-  // call runs cleanup (or the revert is undone via session.unrevert).
++  // v2 keeps the staged boundary until the next prompt commits it or
++  // session.unrevert (DELETE revert) discards it.
+   revert?: {
+     messageID: string
+     partID?: string
+@@ -175,9 +217,9 @@ export interface HealthResponse {
+ 
+ const REQUEST_TIMEOUT_MS = 30_000
+ 
+-// Thrown by request() on a non-2xx response. Carries the HTTP status so
+-// callers can distinguish e.g. 404 (older server, endpoint missing) from
+-// other failures without parsing the message string.
++// Thrown by request() on a non-2xx, non-auth response. Carries the HTTP status
++// so callers can distinguish e.g. 404 (older server, endpoint missing) or 409
++// (session busy) from other failures without parsing the message string.
+ export class ApiError extends Error {
+   status: number
+   constructor(status: number, body: string) {
+@@ -191,6 +233,17 @@ function createHeaders(config: ClientConfig): HeadersInit {
+   return buildRequestHeaders(config)
+ }
+ 
++// v2 location-scoped endpoints take the directory as a bracketed query param:
++// `location[directory]=/path/to/dir` (verified against a live v2 server).
++function locationQuery(directory?: string): string {
++  return directory ? `location%5Bdirectory%5D=${encodeURIComponent(directory)}` : ""
++}
++
++function appendQuery(path: string, query: string): string {
++  if (!query) return path
++  return `${path}${path.includes("?") ? "&" : "?"}${query}`
++}
++
+ // `timeoutMs` lets specific callers (e.g. the onboarding health-check) fail
+ // faster than the general REQUEST_TIMEOUT_MS used by real session calls.
+ // Leave it unset to get the default.
+@@ -213,10 +266,15 @@ async function request<T>(
+ 
+   if (!response.ok) {
+     const error = await response.text()
+-    throw apiErrorFor(response.status, `API Error: ${response.status} - ${error}`)
++    const message = `API Error: ${response.status} - ${error}`
++    throw isAuthStatus(response.status) ? apiErrorFor(response.status, message) : new ApiError(response.status, message)
+   }
+ 
+-  return response.json()
++  // Several v2 endpoints answer 204/empty (model/agent selection, form &
++  // permission replies) — parsing "" as JSON would throw.
++  const body = await response.text()
++  if (!body) return undefined as T
++  return JSON.parse(body)
+ }
+ 
+ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
+@@ -245,7 +303,35 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutM
+   }
+ }
+ 
+-export function createClient(config: ClientConfig) {
++// Minimal shape of a stream reader we need for the idle watchdog (expo/fetch
++// returns its own ReadableStream reader type; structural typing avoids fighting
++// with it).
++type ReaderLike = {
++  read: () => Promise<{ done?: boolean; value?: Uint8Array }>
++  cancel?: () => Promise<void>
++}
++
++// The v2 server emits an SSE comment frame (`: heartbeat`) every 15s, so any
++// bytes on the wire prove the connection is alive. 45s of total silence means
++// the stream is dead — the usual case after Android backgrounds/freezes the
++// app, where the socket goes half-open: `read()` hangs forever instead of
++// reporting a close. Without this watchdog the app would sit "connected" with
++// a frozen event stream until the next HTTP call happens to fail.
++const SSE_IDLE_TIMEOUT_MS = 45_000
++
++async function readWithIdleTimeout(reader: ReaderLike, ms: number): Promise<{ done?: boolean; value?: Uint8Array } | "idle"> {
++  let timer: ReturnType<typeof setTimeout> | undefined
++  // Swallow the read rejection: if the fetch is aborted while this race is
++  // settling, the losing read promise must not become an unhandled rejection.
++  const read = reader.read().catch(() => ({ done: true, value: undefined }))
++  try {
++    return await Promise.race([read, new Promise<"idle">((resolve) => { timer = setTimeout(() => resolve("idle"), ms) })])
++  } finally {
++    clearTimeout(timer)
++  }
++}
++
++function createV2Client(config: ClientConfig) {
+   // Normalize once: a trailing slash on baseUrl (e.g. pasted into Advanced
+   // mode or the Edit screen) would otherwise survive into every
+   // `${config.baseUrl}${path}` concatenation below as a double slash, which
+@@ -253,16 +339,25 @@ export function createClient(config: ClientConfig) {
+   // reconstructs a clean URL, reports "works now"). A bare URL with no
+   // trailing slash is untouched.
+   config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") }
++  const translator = new V2EventTranslator()
++  const loc = () => locationQuery(config.directory)
++
++  const getSession = async (sessionID: string): Promise<Session> => {
++    const body = await request<{ data: V2SessionInfo }>(config, `/api/session/${sessionID}`)
++    return toSession(body.data)
++  }
++
+   return {
+     global: {
+-      // `timeoutMs` overrides the default REQUEST_TIMEOUT_MS — used by the
+-      // onboarding connection test to fail fast on a bad/unreachable IP
+-      // instead of hanging for the full 30s (issue: first-run bounce).
+-      health: (timeoutMs?: number) => request<HealthResponse>(config, "/global/health", {}, timeoutMs),
++      // GET /api/info reports server identity/readiness — any 2xx means healthy.
++      health: async (timeoutMs?: number): Promise<HealthResponse> => {
++        const info = await request<{ version?: string }>(config, "/api/info", {}, timeoutMs)
++        return { healthy: true, version: info.version ?? "" }
++      },
+       // SSE event stream - returns async iterator
+       // Pass an AbortSignal to cancel the connection
+       async *events(signal?: AbortSignal): AsyncGenerator<Event> {
+-        const url = `${config.baseUrl}/global/event`
++        const url = `${config.baseUrl}/api/event`
+         const headers = createHeaders(config)
+         // Remove Content-Type for SSE (it's text/event-stream)
+         delete (headers as Record<string, string>)["Content-Type"]
+@@ -276,11 +371,18 @@ export function createClient(config: ClientConfig) {
+         const reader = response.body.getReader()
+         const decoder = new TextDecoder()
+         const parser = new SSEParser()
++        translator.reset()
+ 
+         let receivedFirstByte = false
+         try {
+           while (true) {
+-            const { done, value } = await reader.read()
++            const chunk = await readWithIdleTimeout(reader as ReaderLike, SSE_IDLE_TIMEOUT_MS)
++            if (chunk === "idle") {
++              console.warn(`[SSE] no data for ${SSE_IDLE_TIMEOUT_MS / 1000}s (server heartbeats every 15s) — dropping dead stream`)
++              void reader.cancel?.().catch(() => {})
++              throw new Error("Event stream idle — no heartbeat received")
++            }
++            const { done, value } = chunk
+             if (done) {
+               console.log("[SSE] stream ended")
+               break
+@@ -293,7 +395,10 @@ export function createClient(config: ClientConfig) {
+ 
+             for (const data of parser.push(decoder.decode(value, { stream: true }))) {
+               try {
+-                yield JSON.parse(data)
++                const raw = JSON.parse(data) as V2RawEvent
++                for (const translated of translator.translate(raw)) {
++                  yield translated
++                }
+               } catch (err) {
+                 console.warn("[SSE] Failed to parse event", {
+                   length: data.length,
+@@ -309,93 +414,148 @@ export function createClient(config: ClientConfig) {
+     },
+ 
+     project: {
+-      list: () => request<Project[]>(config, "/project"),
+-      current: () => request<Project>(config, "/project/current"),
++      // Bare array on v2 (no envelope).
++      list: async (): Promise<Project[]> => {
++        const body = await request<V2ProjectInfo[]>(config, "/api/project")
++        return (body || []).map(toProject)
++      },
++      current: async (): Promise<Project> => {
++        const info = await request<{ directory: string; project?: { id: string; directory: string; canonical: string } }>(
++          config,
++          appendQuery("/api/location", loc()),
++        )
++        return {
++          id: info.project?.id ?? "",
++          name: info.project?.canonical ?? info.directory,
++          path: {
++            cwd: info.directory,
++            root: info.project?.canonical ?? info.directory,
++            absolute: info.directory,
++          },
++        }
++      },
+     },
+ 
+     // Server-side filesystem browsing, scoped to this client's directory
+-    // (see ClientConfig.directory / x-opencode-directory header). Use
++    // (see ClientConfig.directory / location query param). Use
+     // clientForDirectory(dir) to get a client rooted at a specific folder,
+-    // then list("." ) to enumerate its immediate children.
++    // then list(".") to enumerate its immediate children.
+     file: {
+-      list: (params: { path?: string } = {}) => {
++      list: async (params: { path?: string } = {}): Promise<FileEntry[]> => {
+         const query = new URLSearchParams({ path: params.path ?? "." })
+-        return request<FileEntry[]>(config, `/file?${query.toString()}`)
+-      },
+-      // Enumerate the server's filesystem roots (mounted drives, home dir)
+-      // to seed the directory browser's pinned top-level entries. Resolves
+-      // to null on servers that don't yet expose GET /file/roots (older
+-      // opencode builds) so callers fall back to manual path entry instead
+-      // of crashing; other errors propagate like any other request.
+-      roots: async (): Promise<FileRoot[] | null> => {
+-        try {
+-          return await request<FileRoot[]>(config, "/file/roots")
+-        } catch (err) {
+-          if (err instanceof ApiError && err.status === 404) return null
+-          throw err
+-        }
++        const body = await request<{ location?: V2LocationRef; data: V2FsEntry[] }>(
++          config,
++          `/api/fs/list?${query.toString()}${loc() ? `&${loc()}` : ""}`,
++        )
++        return toFileEntries(body.location, body.data || [])
+       },
++      // v2 has no filesystem-roots endpoint — resolve null so the directory
++      // browser falls back to manual path entry (same as pre-roots servers).
++      roots: async (): Promise<FileRoot[] | null> => null,
+     },
+ 
+     path: {
+-      get: () =>
+-        request<{ home: string; state: string; config: string; worktree: string; directory: string }>(config, "/path"),
++      // v2 exposes the resolved location; there is no separate home/state
++      // config, so `home` falls back to the server's current directory (used
++      // by the directory browser only to expand `~`).
++      get: async () => {
++        const info = await request<{ directory: string; project?: { id: string; directory: string; canonical: string } }>(
++          config,
++          appendQuery("/api/location", loc()),
++        )
++        return {
++          home: info.directory,
++          state: "",
++          config: "",
++          worktree: info.project?.canonical ?? info.directory,
++          directory: info.directory,
++        }
++      },
+     },
+ 
+     session: {
+-      // Prefer the GLOBAL experimental endpoint (all sessions across every
+-      // directory) so the Recent Sessions list works without the user first
+-      // picking a folder — a directory-less GET /session is directory-scoped
+-      // and returns [] on servers whose active dir has no sessions. Shaping
+-      // (roots filter, search, sort-by-updated, limit) happens client-side in
+-      // loadSessionList; we fetch /experimental/session with no query params
+-      // because the server applies `limit` before we can filter to roots.
+-      // Falls back to the legacy /session path only on 404 (older servers).
++      // v2 GET /api/session without a directory filter returns sessions across
++      // every project (verified live), so it plays the role of the old global
++      // experimental endpoint. Shaping (roots filter, search, sort, limit)
++      // still happens client-side in loadSessionList — fetch a generous pool
++      // because the server applies `limit` before we can filter.
+       list: (params?: { roots?: boolean; limit?: number; search?: string }): Promise<Session[]> =>
+         loadSessionList(
+           {
+             getExperimental: async (): Promise<Session[] | null> => {
+-              const response = await fetchWithTimeout(`${config.baseUrl}/experimental/session`, {
++              const response = await fetchWithTimeout(`${config.baseUrl}/api/session?limit=500&order=desc`, {
+                 headers: createHeaders(config),
+               })
+-              // Older servers lack this route — signal fallback to legacy /session.
++              // v1 servers lack /api/session — signal fallback to legacy /session.
+               if (response.status === 404) return null
+               if (!response.ok) {
+                 const body = await response.text()
+                 throw apiErrorFor(response.status, `API Error: ${response.status} - ${body}`)
+               }
+-              return response.json()
++              const body = (await response.json()) as { data?: V2SessionInfo[] }
++              return (body.data || []).map(toSession)
+             },
++            // Legacy fallback only runs against v1 servers, whose /session
++            // response is already in this app's Session shape — pass through.
+             getLegacy: (query) => request<Session[]>(config, `/session${query}`),
+           },
+           params,
+         ),
+ 
+-      get: (sessionID: string) => request<Session>(config, `/session/${sessionID}`),
++      get: getSession,
+ 
+-      create: (params?: { title?: string }) =>
+-        request<Session>(config, "/session", {
++      create: async (params?: { title?: string }): Promise<Session> => {
++        const body = await request<{ data: V2SessionInfo }>(config, "/api/session", {
+           method: "POST",
+           body: JSON.stringify(params || {}),
+-        }),
++        })
++        return toSession(body.data)
++      },
+ 
+-      delete: (sessionID: string) => request<void>(config, `/session/${sessionID}`, { method: "DELETE" }),
++      delete: (sessionID: string) => request<void>(config, `/api/session/${sessionID}`, { method: "DELETE" }),
+ 
+-      update: (sessionID: string, params: { title?: string; time?: { archived?: number } }) =>
+-        request<Session>(config, `/session/${sessionID}`, {
++      // PATCH only answers 204 on v2 — re-fetch so callers get the updated
++      // Session like v1 did.
++      update: async (sessionID: string, params: { title?: string; time?: { archived?: number } }): Promise<Session> => {
++        await request<void>(config, `/api/session/${sessionID}`, {
+           method: "PATCH",
+-          body: JSON.stringify(params),
+-        }),
+-
+-      messages: (sessionID: string, params?: { limit?: number }) => {
+-        const query = new URLSearchParams()
+-        if (params?.limit) query.set("limit", String(params.limit))
+-        const qs = query.toString()
+-        return request<MessageWithParts[]>(config, `/session/${sessionID}/message${qs ? `?${qs}` : ""}`)
++          body: JSON.stringify({ title: params.title }),
++        })
++        return getSession(sessionID)
++      },
++
++      // v2 pages newest-first with order=desc; the app's store is oldest-first,
++      // so every page is reversed. With no limit, follow cursor.next until the
++      // timeline is exhausted (loadOlderMessages wants ALL messages).
++      messages: async (sessionID: string, params?: { limit?: number }): Promise<MessageWithParts[]> => {
++        if (params?.limit) {
++          const body = await request<{ data: V2Message[] }>(
++            config,
++            `/api/session/${sessionID}/message?order=desc&limit=${params.limit}`,
++          )
++          return toMessageWithParts(body.data || []).reverse()
++        }
++        const all: V2Message[] = []
++        let cursor: string | null = null
++        for (let page = 0; page < 50; page++) {
++          // v2 rejects cursor+order together — the cursor already encodes direction.
++          const qs: string = cursor ? `cursor=${encodeURIComponent(cursor)}` : "order=desc"
++          const body: { data: V2Message[]; cursor?: { next?: string | null } } = await request<{ data: V2Message[]; cursor?: { next?: string | null } }>(
++            config,
++            `/api/session/${sessionID}/message?${qs}`,
++          )
++          all.push(...(body.data || []))
++          cursor = body.cursor?.next ?? null
++          if (!cursor) break
++        }
++        return toMessageWithParts(all).reverse()
+       },
+ 
+       // Sends a message and returns the response
+-      // Fire-and-forget async prompt - SSE events drive all real-time updates
++      // Fire-and-forget async prompt - SSE events drive all real-time updates.
++      // v2 model/agent selection is session state, applied before the prompt;
++      // a staged revert (from "edit message") is committed automatically by the
++      // next prompt (verified live), so no explicit commit call is needed.
+       prompt: async (
+         sessionID: string,
+         params: {
+@@ -405,19 +565,35 @@ export function createClient(config: ClientConfig) {
+           variant?: string
+         },
+       ): Promise<void> => {
+-        const url = `${config.baseUrl}/session/${sessionID}/prompt_async`
+-        const headers = createHeaders(config)
+-        const body = JSON.stringify(params)
+-        const response = await fetchWithTimeout(url, {
++        if (params.model) {
++          await request<void>(config, `/api/session/${sessionID}/model`, {
++            method: "POST",
++            body: JSON.stringify({
++              model: {
++                id: params.model.modelID,
++                providerID: params.model.providerID,
++                ...(params.variant ? { variant: params.variant } : {}),
++              },
++            }),
++          })
++        }
++        if (params.agent) {
++          await request<void>(config, `/api/session/${sessionID}/agent`, {
++            method: "POST",
++            body: JSON.stringify({ agent: params.agent }),
++          })
++        }
++        const text = params.parts
++          .filter((p): p is { type: "text"; text: string } => p.type === "text")
++          .map((p) => p.text)
++          .join("\n")
++        const files = params.parts
++          .filter((p): p is { type: "file"; mime: string; url: string; filename?: string } => p.type === "file")
++          .map((p) => ({ uri: p.url, ...(p.filename ? { name: p.filename } : {}) }))
++        await request(config, `/api/session/${sessionID}/prompt`, {
+           method: "POST",
+-          headers,
+-          body,
++          body: JSON.stringify({ text, files }),
+         })
+-
+-        if (!response.ok) {
+-          const error = await response.text()
+-          throw new Error(`Failed to send message: ${response.status} - ${error}`)
+-        }
+       },
+ 
+       command: async (
+@@ -431,107 +607,179 @@ export function createClient(config: ClientConfig) {
+           parts?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
+         },
+       ): Promise<void> => {
+-        const url = `${config.baseUrl}/session/${sessionID}/command`
+-        const headers = createHeaders(config)
+-
+-        const response = await fetchWithTimeout(url, {
++        await request(config, `/api/session/${sessionID}/command`, {
+           method: "POST",
+-          headers,
+-          body: JSON.stringify({ ...params, sessionID }),
++          body: JSON.stringify({
++            name: params.command,
++            text: params.arguments,
++            files: (params.parts || []).map((p) => ({ uri: p.url, ...(p.filename ? { name: p.filename } : {}) })),
++          }),
+         })
+-
+-        if (!response.ok) {
+-          const error = await response.text()
+-          throw new Error(`Failed to run command: ${response.status} - ${error}`)
+-        }
+       },
+ 
+-      abort: (sessionID: string) => request<boolean>(config, `/session/${sessionID}/abort`, { method: "POST" }),
++      // v2 replaces abort with interrupt (POST returns {interrupted}).
++      abort: async (sessionID: string): Promise<boolean> => {
++        const body = await request<{ interrupted?: boolean }>(config, `/api/session/${sessionID}/interrupt`, {
++          method: "POST",
++        })
++        return Boolean(body.interrupted)
++      },
+ 
+-      diff: (sessionID: string, messageID?: string) => {
+-        const qs = messageID ? `?messageID=${messageID}` : ""
+-        return request<unknown[]>(config, `/session/${sessionID}/diff${qs}`)
++      // v2 diff is turn-based (from/to), no messageID scoping needed —
++      // callers get the session's structured per-file diffs.
++      diff: async (sessionID: string): Promise<unknown[]> => {
++        const body = await request<{ data: unknown[] }>(config, `/api/session/${sessionID}/diff`)
++        return body.data || []
+       },
+ 
+-      // Marks messageID (and everything after it) as pending revert. The
+-      // underlying messages aren't deleted until the next prompt runs
+-      // cleanup, or the revert is undone with unrevert() below.
+-      revert: (sessionID: string, messageID: string, partID?: string) =>
+-        request<Session>(config, `/session/${sessionID}/revert`, {
++      // Stages a reversible session boundary at messageID. The underlying
++      // messages aren't deleted until the next prompt commits the revert, or
++      // unrevert() below discards it. The stage endpoint answers with the
++      // boundary itself, so re-fetch the session for its updated `revert`.
++      revert: async (sessionID: string, messageID: string): Promise<Session> => {
++        await request(config, `/api/session/${sessionID}/revert/stage`, {
+           method: "POST",
+-          body: JSON.stringify(partID ? { messageID, partID } : { messageID }),
+-        }),
++          body: JSON.stringify({ messageID }),
++        })
++        return getSession(sessionID)
++      },
+ 
+-      unrevert: (sessionID: string) =>
+-        request<Session>(config, `/session/${sessionID}/unrevert`, {
+-          method: "POST",
+-        }),
++      unrevert: async (sessionID: string): Promise<Session> => {
++        await request<void>(config, `/api/session/${sessionID}/revert`, { method: "DELETE" })
++        return getSession(sessionID)
++      },
+     },
+ 
+     permission: {
+-      list: () =>
+-        request<Array<{ id: string; sessionID: string; tool: string; input: unknown }>>(config, "/permission"),
++      // v2 permission requests are session-scoped; refreshPending always knows
++      // the session it's refreshing, so prefer the session endpoint and only
++      // hit the location-global one as a fallback.
++      list: async (sessionID?: string) => {
++        const path = sessionID ? `/api/session/${sessionID}/permission` : appendQuery("/api/permission/request", loc())
++        const body = await request<{ data: V2PermissionRequest[] }>(config, path)
++        const out = (body.data || []).map((p) => {
++          rememberPermissionRequest(p)
++          return toPermissionRequest(p)
++        })
++        return out
++      },
+ 
+-      reply: (requestID: string, reply: "once" | "always" | "reject") =>
+-        request<boolean>(config, `/permission/${requestID}/reply`, {
++      reply: async (requestID: string, reply: "once" | "always" | "reject"): Promise<boolean> => {
++        const known = pendingRequestInfo(requestID)
++        if (!known) throw new Error(`Unknown permission request: ${requestID}`)
++        await request<void>(config, `/api/session/${known.sessionID}/permission/${requestID}/reply`, {
+           method: "POST",
+-          body: JSON.stringify({ reply }),
+-        }),
++          body: JSON.stringify({ decision: reply }),
++        })
++        return true
++      },
+     },
+ 
+     question: {
+-      list: () => request<Array<{ id: string; sessionID: string; questions: unknown[] }>>(config, "/question"),
++      // v2 calls these "forms"; they map 1:1 onto the app's question prompts.
++      list: async (sessionID?: string) => {
++        const path = sessionID ? `/api/session/${sessionID}/form` : appendQuery("/api/form", loc())
++        const body = await request<{ data: V2FormInfo[] }>(config, path)
++        const out = (body.data || []).map((f) => {
++          rememberForm(f)
++          return toQuestionRequest(f)
++        })
++        return out
++      },
+ 
+-      reply: (requestID: string, answers: string[][]) =>
+-        request<boolean>(config, `/question/${requestID}/reply`, {
++      reply: async (requestID: string, answers: string[][]): Promise<boolean> => {
++        const known = pendingRequestInfo(requestID)
++        if (!known) throw new Error(`Unknown question request: ${requestID}`)
++        await request<void>(config, `/api/session/${known.sessionID}/form/${requestID}/reply`, {
+           method: "POST",
+-          body: JSON.stringify({ answers }),
+-        }),
++          body: JSON.stringify({ answer: formAnswerFromFields(known.fields, answers) }),
++        })
++        return true
++      },
+ 
+-      reject: (requestID: string) =>
+-        request<boolean>(config, `/question/${requestID}/reject`, {
+-          method: "POST",
+-        }),
++      reject: async (requestID: string): Promise<boolean> => {
++        const known = pendingRequestInfo(requestID)
++        if (!known) throw new Error(`Unknown question request: ${requestID}`)
++        await request<void>(config, `/api/session/${known.sessionID}/form/${requestID}`, { method: "DELETE" })
++        return true
++      },
+     },
+ 
+     agent: {
+-      list: () => request<Agent[]>(config, "/agent"),
++      list: async (): Promise<Agent[]> => {
++        const body = await request<{ data: V2AgentInfo[] }>(config, appendQuery("/api/agent", loc()))
++        return (body.data || []).map(toAgent)
++      },
+     },
+ 
+     command: {
+-      list: () => request<Command[]>(config, "/command"),
++      list: async (): Promise<Command[]> => {
++        const body = await request<{ data: V2CommandInfo[] }>(config, appendQuery("/api/command", loc()))
++        return (body.data || []).map(toCommand)
++      },
+     },
+ 
+     provider: {
+-      list: () =>
+-        request<{
+-          all: Array<{
+-            id: string
+-            name: string
+-            models: Record<
+-              string,
+-              {
+-                id: string
+-                name: string
+-                attachment: boolean
+-                reasoning: boolean
+-                tool_call: boolean
+-                cost?: { input: number; output: number }
+-                limit: { context: number; output: number }
+-                status?: "alpha" | "beta" | "deprecated" | "active"
+-                variants?: Record<string, { reasoningEffort?: string }>
+-              }
+-            >
+-          }>
+-          default: Record<string, string>
+-          connected: string[]
+-        }>(config, "/provider"),
++      list: async () => {
++        // Models are location-scoped; without a configured directory, resolve
++        // the server's active location so the model catalog is never empty.
++        let location = loc()
++        if (!location) {
++          try {
++            const here = await request<{ directory: string }>(config, "/api/location")
++            location = locationQuery(here.directory)
++          } catch {
++            // leave unscoped — provider list alone still renders something
++          }
++        }
++        const [providers, models, defaultModel] = await Promise.all([
++          request<{ data: V2ProviderInfo[] }>(config, appendQuery("/api/provider", location)),
++          request<{ data: V2ModelInfo[] }>(config, appendQuery("/api/model", location)),
++          request<{ data: V2ModelInfo | null }>(config, appendQuery("/api/model/default", location)),
++        ])
++        return toProviderCatalog(providers.data || [], models.data || [], defaultModel.data ?? null)
++      },
+     },
+ 
+     config: {
+-      get: () => request<unknown>(config, "/config"),
++      get: () => request<unknown>(config, "/api/config"),
+     },
+   }
+ }
+ 
+-export type Client = ReturnType<typeof createClient>
++export type Client = ReturnType<typeof createV2Client>
++
++// --- v1 / v2 transport dispatch ---------------------------------------------
++// `npm install -g opencode-ai` still installs the v1 line (1.18.32 as of
++// 2026-09-24), so a server that predates the /api/ rewrite is the common case,
++// not an edge case. probeServer() decides which transport a connection uses;
++// the answer is stored on the connection (ServerConnection.api) so every client
++// built from it — including the per-directory ones from clientForDirectory —
++// gets the same one without re-probing.
++export function createClient(config: ClientConfig): Client {
++  if (config.api === "v1") {
++    // Both clients implement the same runtime contract. The cast covers the one
++    // place their types differ nominally: v1's /question and /permission lists
++    // hand back untyped records, while the v2 mapper produces shaped requests —
++    // and events.ts already treats both as records in refreshPending().
++    return createV1Client(config) as unknown as Client
++  }
++  return createV2Client(config)
++}
++
++// A probe is a diagnostic, not a session call: it should answer in about a
++// second on a LAN and give up before the onboarding flow's own timeout.
++const PROBE_TIMEOUT_MS = 8_000
++
++/** Probe a connection and report which server API it speaks (see api-detect.ts). */
++export async function probeServer(config: ClientConfig): Promise<ServerIdentity> {
++  const normalized: ClientConfig = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") }
++  const headers = createHeaders(normalized)
++  const probe: ProbeRequest = async (path) => {
++    const response = await fetchWithTimeout(`${normalized.baseUrl}${path}`, { headers }, PROBE_TIMEOUT_MS)
++    const contentType = response.headers.get("content-type") ?? ""
++    const body = await response.text().catch(() => "")
++    return { status: response.status, contentType, body }
++  }
++  return detectServerApi(probe)
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index d61a45c..060c862 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -1,3 +1,5 @@
++import type { ServerApi } from "./api-detect"
++
+ // Connection types for multiple server support
+ export type ConnectionType = "local" | "tunnel" | "cloud"
+ 
+@@ -15,6 +17,12 @@ export interface ServerConnection {
+   lastConnected?: number
+   // Is this the active connection?
+   active?: boolean
++  // Which server API the last probe found. "v1" means the server predates the
++  // /api/ rewrite (opencode <= 1.18.x) and gets the legacy transport from
++  // sdk-v1.ts. Absent means "not probed yet", which behaves as v2.
++  api?: ServerApi
++  // Server version reported by that probe, shown in the connection UI.
++  serverVersion?: string
+ }
+ 
+ export interface AppSettings {
+diff --git a/src/lib/v2-shape.test.ts b/src/lib/v2-shape.test.ts
+new file mode 100644
+index 0000000..d0695d8
+--- /dev/null
++++ b/src/lib/v2-shape.test.ts
+@@ -0,0 +1,359 @@
++import { test } from "node:test"
++import assert from "node:assert/strict"
++import {
++  formAnswerFromFields,
++  pendingRequestInfo,
++  rememberForm,
++  toMessageWithParts,
++  toProviderCatalog,
++  toQuestionRequest,
++  toSession,
++  V2EventTranslator,
++  type V2FormField,
++  type V2Message,
++  type V2ModelInfo,
++  type V2RawEvent,
++  type V2SessionInfo,
++} from "./v2-shape.ts"
++
++// Fixtures mirror the live v2 server capture (docs/v2-api-map.md): a prompt
++// runs as execution -> steps -> text/reasoning/tool events -> idle.
++
++const ev = (type: string, data: Record<string, unknown>): V2RawEvent => ({
++  id: `evt-${type}`,
++  created: 1000,
++  type,
++  data,
++})
++
++test("toSession maps v2 location/time/revert into the app shape", () => {
++  const info: V2SessionInfo = {
++    id: "ses_1",
++    projectID: "proj1",
++    title: "Hello",
++    location: { directory: "/srv/proj" },
++    time: { created: 10, updated: 20 },
++    revert: { messageID: "msg_9" },
++    parentID: "ses_0",
++  }
++  assert.deepEqual(toSession(info), {
++    id: "ses_1",
++    slug: "",
++    projectID: "proj1",
++    directory: "/srv/proj",
++    parentID: "ses_0",
++    title: "Hello",
++    version: "",
++    time: { created: 10, updated: 20, archived: undefined },
++    revert: { messageID: "msg_9", partID: undefined },
++  })
++})
++
++test("toMessageWithParts reshapes user/assistant and drops timeline markers", () => {
++  const messages: V2Message[] = [
++    {
++      id: "msg_u1",
++      sessionID: "ses_1",
++      type: "user",
++      time: { created: 1 },
++      text: "hi",
++      files: [{ data: "YWJj", mime: "image/png", name: "a.png" }],
++    },
++    {
++      id: "msg_i1",
++      type: "idle",
++      time: { created: 2 },
++      outcome: "succeeded",
++    },
++    {
++      id: "msg_a1",
++      sessionID: "ses_1",
++      type: "assistant",
++      time: { created: 3, completed: 4 },
++      agent: "build",
++      model: { id: "m1", providerID: "p1" },
++      finish: "stop",
++      cost: 0.5,
++      tokens: { input: 1, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
++      content: [
++        { type: "reasoning", text: "thinking..." },
++        {
++          type: "tool",
++          id: "call1",
++          name: "write",
++          state: {
++            status: "completed",
++            input: { path: "/x" },
++            content: [{ type: "text", text: "done" }],
++            metadata: { title: "/x" },
++          },
++          time: { created: 5, completed: 6 },
++        },
++        { type: "text", text: "final answer" },
++      ],
++    },
++  ]
++  const out = toMessageWithParts(messages)
++  assert.equal(out.length, 2, "idle marker dropped")
++
++  const user = out[0]
++  assert.equal(user.info.role, "user")
++  assert.deepEqual(user.parts.map((p) => p.type), ["text", "file"])
++  assert.equal(user.parts[1].url, "data:image/png;base64,YWJj")
++
++  const assistant = out[1]
++  assert.equal(assistant.info.role, "assistant")
++  assert.equal(assistant.info.modelID, "m1")
++  assert.equal(assistant.info.providerID, "p1")
++  assert.equal(assistant.info.finish, "stop")
++  assert.deepEqual(assistant.parts.map((p) => p.type), ["reasoning", "tool", "text"])
++  const tool = assistant.parts[1]
++  assert.equal(tool.tool, "write")
++  assert.equal(tool.state?.status, "completed")
++  assert.equal(tool.state?.output, "done")
++  assert.equal(tool.state?.title, "/x")
++})
++
++test("error tool state surfaces a message the ToolCallCard can render", () => {
++  const out = toMessageWithParts([
++    {
++      id: "msg_a1",
++      sessionID: "s",
++      type: "assistant",
++      time: { created: 1 },
++      content: [
++        {
++          type: "tool",
++          id: "c1",
++          name: "bash",
++          state: { status: "error", input: { command: "false" }, error: { data: { message: "exit 1" } } },
++        },
++      ],
++    },
++  ])
++  const state = out[0].parts[0].state
++  assert.equal(state?.status, "error")
++  assert.equal(state?.error?.message, "exit 1")
++})
++
++test("translator replays a live execution flow into v1-style events", () => {
++  const t = new V2EventTranslator()
++  const stream: V2RawEvent[] = [
++    { type: "server.connected", data: {} },
++    ev("session.execution.started", { sessionID: "ses_1" }),
++    ev("session.step.started", {
++      sessionID: "ses_1",
++      agent: "build",
++      model: { id: "m1", providerID: "p1" },
++      assistantMessageID: "msg_a1",
++      started: 100,
++    }),
++    ev("session.reasoning.started", { sessionID: "ses_1", assistantMessageID: "msg_a1", ordinal: 0 }),
++    ev("session.reasoning.delta", { sessionID: "ses_1", assistantMessageID: "msg_a1", ordinal: 0, delta: "thi" }),
++    ev("session.reasoning.ended", { sessionID: "ses_1", assistantMessageID: "msg_a1", ordinal: 0, text: "thinking" }),
++    ev("session.tool.input.started", { sessionID: "ses_1", assistantMessageID: "msg_a1", id: "c1", name: "write" }),
++    ev("session.tool.input.delta", { sessionID: "ses_1", assistantMessageID: "msg_a1", id: "c1", delta: '{"path":' }),
++    ev("session.tool.input.ended", { sessionID: "ses_1", assistantMessageID: "msg_a1", id: "c1", text: '{"path":"/x"}' }),
++    ev("session.tool.called", { sessionID: "ses_1", assistantMessageID: "msg_a1", id: "c1", input: { path: "/x" } }),
++    ev("session.tool.success", {
++      sessionID: "ses_1",
++      assistantMessageID: "msg_a1",
++      id: "c1",
++      content: [{ type: "text", text: "Created /x" }],
++      metadata: { title: "/x" },
++    }),
++    ev("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_a1", finish: "tool-calls", cost: 0, tokens: { input: 1, output: 2 } }),
++    ev("session.text.started", { sessionID: "ses_1", assistantMessageID: "msg_a2", ordinal: 0 }),
++    ev("session.text.delta", { sessionID: "ses_1", assistantMessageID: "msg_a2", ordinal: 0, delta: "3+3=" }),
++    ev("session.text.delta", { sessionID: "ses_1", assistantMessageID: "msg_a2", ordinal: 0, delta: "6" }),
++    ev("session.text.ended", { sessionID: "ses_1", assistantMessageID: "msg_a2", ordinal: 0, text: "3+3=6" }),
++    ev("session.usage.updated", { sessionID: "ses_1", cost: 1, tokens: { input: 9, output: 4 } }),
++    ev("session.execution.succeeded", { sessionID: "ses_1" }),
++  ]
++
++  const out = stream.flatMap((e) => t.translate(e))
++  const types = out.map((e) => e.type)
++
++  assert.equal(types[0], "session.status")
++  assert.deepEqual((out[0].properties.status as { type: string }).type, "busy")
++
++  // Assistant messages synthesized per step
++  const messageUpdates = out.filter((e) => e.type === "message.updated")
++  assert.deepEqual(
++    messageUpdates.map((e) => (e.properties.info as { id: string }).id),
++    ["msg_a1", "msg_a1", "msg_a2", "msg_a2"],
++  )
++
++  // Reasoning accumulates and the ended event carries the authoritative text
++  const reasoning = out
++    .filter((e) => e.type === "message.part.updated")
++    .map((e) => e.properties.part as { type: string; text?: string })
++    .filter((p) => p.type === "reasoning")
++  assert.deepEqual(reasoning.map((p) => p.text), ["", "thi", "thinking"])
++
++  // Tool part: running while streaming input, completed with parsed input + output
++  const toolParts = out
++    .filter((e) => e.type === "message.part.updated")
++    .map((e) => e.properties.part as { type: string; state?: { status: string; input?: unknown; output?: string; title?: string } })
++    .filter((p) => p.type === "tool")
++  assert.equal(toolParts[0].state?.status, "running")
++  assert.equal(toolParts[toolParts.length - 1].state?.status, "completed")
++  assert.deepEqual(toolParts[toolParts.length - 1].state?.input, { path: "/x" })
++  assert.equal(toolParts[toolParts.length - 1].state?.output, "Created /x")
++  assert.equal(toolParts[toolParts.length - 1].state?.title, "/x")
++
++  // Text deltas accumulate into the full text
++  const textParts = out
++    .filter((e) => e.type === "message.part.updated")
++    .map((e) => e.properties.part as { type: string; text?: string })
++    .filter((p) => p.type === "text")
++  assert.deepEqual(textParts.map((p) => p.text), ["", "3+3=", "3+3=6", "3+3=6"])
++
++  // Usage attaches cost/tokens to the latest assistant message
++  const lastUpdate = messageUpdates[messageUpdates.length - 1].properties.info as { cost?: number; tokens?: { input: number } }
++  assert.equal(lastUpdate.cost, 1)
++  assert.equal(lastUpdate.tokens?.input, 9)
++
++  // Execution end -> idle status
++  const last = out[out.length - 1]
++  assert.equal(last.type, "session.status")
++  assert.deepEqual((last.properties.status as { type: string }).type, "idle")
++})
++
++test("execution.failed emits session.error before the idle status", () => {
++  const t = new V2EventTranslator()
++  const out = t.translate(ev("session.execution.failed", { sessionID: "s1", error: { data: { message: "boom" } } }))
++  assert.deepEqual(out.map((e) => e.type), ["session.error", "session.status"])
++  assert.deepEqual((out[0].properties.error as { message: string }).message, "boom")
++})
++
++test("execution.failed handles the live provider error shape {type, message}", () => {
++  // Verified against a v2 server: selecting a nonexistent model produced
++  // session.execution.failed with data.error = {type, message}.
++  const t = new V2EventTranslator()
++  const out = t.translate(
++    ev("session.execution.failed", {
++      sessionID: "s1",
++      error: { type: "provider.no-route", message: "Model unavailable: openrouter/definitely-not-a-real-model" },
++    }),
++  )
++  assert.deepEqual(out.map((e) => e.type), ["session.error", "session.status"])
++  assert.deepEqual((out[0].properties.error as { message: string }).message, "Model unavailable: openrouter/definitely-not-a-real-model")
++})
++
++test("inbox enqueue resolves the optimistic temp message with a real user message", () => {
++  const t = new V2EventTranslator()
++  const out = t.translate(
++    ev("session.inbox.enqueued", {
++      sessionID: "s1",
++      inboxID: "msg_u1",
++      item: { type: "user", payload: { text: "hello", files: [{ data: "YWJj", mime: "image/png", name: "a.png" }] } },
++    }),
++  )
++  assert.deepEqual(out.map((e) => e.type), ["message.updated", "message.part.updated", "message.part.updated"])
++  const info = out[0].properties.info as { id: string; role: string }
++  assert.deepEqual([info.id, info.role], ["msg_u1", "user"])
++  const filePart = out[2].properties.part as { type: string; url?: string }
++  assert.deepEqual([filePart.type, filePart.url], ["file", "data:image/png;base64,YWJj"])
++})
++
++test("permission and form events feed the pending registry and the prompt UI shapes", () => {
++  const t = new V2EventTranslator()
++  const perm = t.translate(
++    ev("permission.asked", { id: "per_1", sessionID: "s1", action: "bash", resources: ["ls"], source: { type: "tool", messageID: "msg_a1", id: "c1" } }),
++  )
++  assert.equal(perm[0].type, "permission.asked")
++  const props = perm[0].properties as { permission: string; patterns: string[]; tool?: { callID: string } }
++  assert.deepEqual([props.permission, props.patterns], ["bash", ["ls"]])
++  assert.equal(props.tool?.callID, "c1")
++  assert.equal(pendingRequestInfo("per_1")?.sessionID, "s1")
++
++  // Live-verified envelope: v2 nests the form under `data.form`, unlike
++  // permission.asked (whose payload is the flat Permission.Request). Captured
++  // from a v2.0.16 server: evt_0d4be7612002H8CTkutJnzghGX. Reading the fields
++  // off `data` directly drops the event and no prompt ever renders.
++  const form = t.translate(
++    ev("form.created", {
++      form: {
++        id: "frm_1",
++        sessionID: "s1",
++        title: "Questions",
++        metadata: { kind: "question" },
++        fields: [
++          { key: "mode", type: "multiselect", title: "Mode", options: [{ value: "fast", label: "Fast" }, { value: "slow", label: "Slow" }] },
++          { key: "note", type: "string", title: "Note" },
++        ],
++      },
++    }),
++  )
++  assert.equal(form[0].type, "question.asked")
++  const q = (form[0].properties as { questions: Array<{ multiple: boolean; custom: boolean }> }).questions
++  assert.equal(q[0].multiple, true)
++  assert.equal(q[1].custom, true)
++  assert.equal(pendingRequestInfo("frm_1")?.sessionID, "s1")
++
++  const gone = t.translate(ev("form.replied", { id: "frm_1", sessionID: "s1" }))
++  assert.equal(gone[0].type, "question.replied")
++  assert.equal(pendingRequestInfo("frm_1"), undefined)
++})
++
++test("form.created also maps when the payload is flat", () => {
++  const t = new V2EventTranslator()
++  const out = t.translate(
++    ev("form.created", { id: "frm_2", sessionID: "s2", title: "Questions", fields: [{ key: "q0", type: "string", title: "Answer" }] }),
++  )
++  assert.equal(out[0].type, "question.asked")
++  assert.equal(pendingRequestInfo("frm_2")?.sessionID, "s2")
++})
++
++test("formAnswerFromFields maps QuestionPrompt labels back to keyed values", () => {
++  const fields: V2FormField[] = [
++    { key: "mode", type: "multiselect", options: [{ value: "fast", label: "Fast" }, { value: "slow", label: "Slow" }] },
++    { key: "note", type: "string" },
++    { key: "ok", type: "boolean" },
++    { key: "count", type: "integer" },
++  ]
++  rememberForm({ id: "frm_x", sessionID: "s", title: "t", fields })
++  const answer = formAnswerFromFields(pendingRequestInfo("frm_x")?.fields, [["Fast", "Slow"], ["free text"], ["Yes"], ["7"]])
++  assert.deepEqual(answer, { mode: ["fast", "slow"], note: "free text", ok: true, count: 7 })
++})
++
++test("toQuestionRequest skips external fields and keeps answer alignment", () => {
++  const req = toQuestionRequest({
++    id: "frm_1",
++    sessionID: "s",
++    title: "t",
++    fields: [
++      { key: "hidden", type: "external" },
++      { key: "name", type: "string", title: "Name" },
++    ],
++  })
++  assert.equal(req.questions.length, 1)
++  assert.equal(req.questions[0].header, "Name")
++})
++
++test("toProviderCatalog rebuilds the v1 provider/model shape", () => {
++  const models: V2ModelInfo[] = [
++    {
++      id: "prov/model-a",
++      modelID: "model-a",
++      providerID: "prov",
++      name: "Model A",
++      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
++      variants: [{ id: "none" }, { id: "high", settings: { reasoning: { effort: "high" } } }],
++      cost: [{ input: 1, output: 2 }],
++      status: "active",
++      enabled: true,
++      limit: { context: 100, output: 50 },
++    },
++  ]
++  const catalog = toProviderCatalog([{ id: "prov", name: "Prov" }], models, models[0])
++  assert.equal(catalog.all.length, 1)
++  assert.equal(catalog.connected.includes("prov"), true)
++  const m = catalog.all[0].models["prov/model-a"]
++  assert.equal(m.attachment, true)
++  assert.equal(m.tool_call, true)
++  assert.equal(m.reasoning, true)
++  assert.deepEqual(m.variants.high, { reasoningEffort: "high" })
++  assert.deepEqual(catalog.default, { prov: "prov/model-a" })
++})
+diff --git a/src/lib/v2-shape.ts b/src/lib/v2-shape.ts
+new file mode 100644
+index 0000000..7d83ee5
+--- /dev/null
++++ b/src/lib/v2-shape.ts
+@@ -0,0 +1,820 @@
++// Conversion layer between the opencode v2 HTTP/SSE payloads and the internal
++// v1-style shapes the stores and chat UI consume (Session, Message, Part,
++// Event {type, properties}, ...). Keeping every mapping in one pure module
++// (only `import type` from sdk.ts, which is erased at runtime) makes it fully
++// unit-testable under plain `node --test` and keeps sdk.ts thin.
++//
++// Reference: docs/v2-api-map.md (verified against a live opencode v2 server).
++import type { Agent, Command, Event, FileEntry, Message, MessageWithParts, Part, Project, Session } from "./sdk"
++
++// --- raw v2 shapes (subset we consume) ---
++
++export interface V2LocationRef {
++  directory: string
++}
++
++export interface V2ModelRef {
++  id: string
++  providerID: string
++  variant?: string
++}
++
++export interface V2Tokens {
++  input: number
++  output: number
++  reasoning?: number
++  cache?: { read: number; write: number }
++}
++
++export interface V2SessionInfo {
++  id: string
++  parentID?: string
++  projectID: string
++  agent?: string
++  model?: V2ModelRef
++  title?: string
++  subpath?: string
++  revert?: { messageID: string; partID?: string }
++  location: V2LocationRef
++  time: { created: number; updated: number; archived?: number; idle?: number }
++}
++
++export interface V2ToolContent {
++  type: "text" | "file"
++  text?: string
++  uri?: string
++  mime?: string
++  name?: string | null
++}
++
++export interface V2ToolState {
++  status: "streaming" | "running" | "completed" | "error"
++  input?: unknown
++  content?: V2ToolContent[]
++  metadata?: Record<string, unknown>
++  error?: { message?: string; data?: { message?: string } } & Record<string, unknown>
++}
++
++export interface V2AssistantContentPart {
++  type: "text" | "reasoning" | "tool"
++  text?: string
++  id?: string
++  name?: string
++  state?: V2ToolState
++  time?: { created?: number; ran?: number; completed?: number }
++}
++
++export interface V2FileAttachment {
++  data?: string
++  mime?: string
++  uri?: string
++  name?: string
++  source?: { type: string; path?: string }
++}
++
++export interface V2Message {
++  id: string
++  sessionID?: string
++  type: string
++  time: { created: number; completed?: number }
++  text?: string
++  files?: V2FileAttachment[]
++  agent?: string
++  model?: V2ModelRef
++  content?: V2AssistantContentPart[]
++  finish?: string
++  cost?: number
++  tokens?: V2Tokens
++  error?: { message?: string; data?: { message?: string } } & Record<string, unknown>
++  outcome?: string
++}
++
++export interface V2PermissionRequest {
++  id: string
++  sessionID: string
++  action: string
++  resources: string[]
++  metadata?: Record<string, unknown>
++  source?: { type: string; messageID?: string; id?: string }
++}
++
++export interface V2FormOption {
++  value: string
++  label: string
++  description?: string
++}
++
++export interface V2FormField {
++  key: string
++  type: "string" | "number" | "integer" | "boolean" | "multiselect" | "external"
++  title?: string
++  description?: string
++  options?: V2FormOption[]
++  custom?: boolean
++}
++
++export interface V2FormInfo {
++  id: string
++  sessionID: string
++  title: string
++  fields: V2FormField[]
++}
++
++export interface V2AgentInfo {
++  id: string
++  name: string
++  description?: string
++  mode: "subagent" | "primary" | "all"
++  hidden?: boolean
++  color?: string
++  model?: V2ModelRef
++  steps?: number
++}
++
++export interface V2CommandInfo {
++  name: string
++  description?: string
++}
++
++export interface V2ModelInfo {
++  id: string
++  modelID: string
++  providerID: string
++  name: string
++  capabilities: { tools: boolean; input: string[]; output: string[] }
++  variants: Array<{ id: string; settings?: { reasoning?: { enabled?: boolean; effort?: string } } }>
++  cost?: Array<{ input: number; output: number }>
++  status?: "alpha" | "beta" | "deprecated" | "active"
++  enabled?: boolean
++  limit: { context: number; output: number }
++}
++
++export interface V2ProviderInfo {
++  id: string
++  name: string
++  activation?: "auto" | "enabled" | "disabled"
++}
++
++export interface V2ProjectInfo {
++  id: string
++  canonical: string
++}
++
++export interface V2FsEntry {
++  path: string
++  type: "file" | "directory"
++}
++
++export interface V2RawEvent {
++  id?: string
++  created?: number
++  type: string
++  data?: Record<string, any>
++}
++
++// --- pending-request registry -------------------------------------------------
++// v2 permission/form replies are session-scoped (`/api/session/{id}/...`), but
++// the app calls `permission.reply(requestID)` globally. Remember which session
++// owns each request (from SSE events and list endpoints — both flow through
++// this module) so the SDK can build the right URL. Forms additionally keep
++// their fields so `question.reply(answers)` can map selected labels back to
++// the keyed Form.Answer object v2 expects.
++
++interface PendingRequest {
++  sessionID: string
++  fields?: V2FormField[]
++}
++
++const pendingRequests = new Map<string, PendingRequest>()
++
++export function rememberPermissionRequest(req: V2PermissionRequest): void {
++  pendingRequests.set(req.id, { sessionID: req.sessionID })
++}
++
++export function rememberForm(form: V2FormInfo): void {
++  pendingRequests.set(form.id, { sessionID: form.sessionID, fields: answerFields(form.fields) })
++}
++
++export function forgetPendingRequest(id: string): void {
++  pendingRequests.delete(id)
++}
++
++export function pendingRequestInfo(id: string): PendingRequest | undefined {
++  return pendingRequests.get(id)
++}
++
++export function clearPendingRequests(): void {
++  pendingRequests.clear()
++}
++
++// --- conversions ---------------------------------------------------------------
++
++export function toSession(info: V2SessionInfo): Session {
++  return {
++    id: info.id,
++    slug: "",
++    projectID: info.projectID,
++    directory: info.location?.directory ?? "",
++    parentID: info.parentID,
++    title: info.title ?? "",
++    version: "",
++    time: {
++      created: info.time?.created ?? 0,
++      updated: info.time?.updated ?? 0,
++      archived: info.time?.archived,
++    },
++    revert: info.revert ? { messageID: info.revert.messageID, partID: info.revert.partID } : undefined,
++  }
++}
++
++function structuredErrorMessage(error: unknown): string {
++  if (!error) return "Session error occurred"
++  if (typeof error === "string") return error
++  const e = error as { message?: string; data?: { message?: string } }
++  return e.message || e.data?.message || JSON.stringify(error)
++}
++
++function attachmentUrl(f: V2FileAttachment): string {
++  if (f.uri) return f.uri
++  if (f.data && f.mime) return `data:${f.mime};base64,${f.data}`
++  if (f.source?.path) return f.source.path
++  return ""
++}
++
++function userParts(messageID: string, msg: { text?: string; files?: V2FileAttachment[] }): Part[] {
++  const parts: Part[] = []
++  if (msg.text) {
++    parts.push({ id: `${messageID}-text`, messageID, type: "text", text: msg.text })
++  }
++  for (const f of msg.files || []) {
++    const url = attachmentUrl(f)
++    if (!url) continue
++    parts.push({ id: `${messageID}-file-${parts.length}`, messageID, type: "file", mime: f.mime, url, filename: f.name })
++  }
++  return parts
++}
++
++function toolOutput(content: V2ToolContent[] | undefined): string | undefined {
++  if (!content || content.length === 0) return undefined
++  const texts = content.map((c) => (c.type === "text" ? c.text : c.uri ? `[${c.name || c.uri}]` : "")).filter(Boolean)
++  return texts.length > 0 ? texts.join("\n") : undefined
++}
++
++function mapToolState(state: V2ToolState | undefined): Part["state"] {
++  if (!state) return { status: "pending" }
++  const title = typeof state.metadata?.title === "string" ? (state.metadata.title as string) : undefined
++  if (state.status === "streaming" || state.status === "running") {
++    return { status: "running", input: state.input, title }
++  }
++  if (state.status === "completed") {
++    return { status: "completed", input: state.input, output: toolOutput(state.content), title }
++  }
++  return {
++    status: "error",
++    input: state.input,
++    output: toolOutput(state.content),
++    title,
++    error: { message: structuredErrorMessage(state.error) },
++  }
++}
++
++function assistantParts(messageID: string, content: V2AssistantContentPart[] | undefined): Part[] {
++  const parts: Part[] = []
++  for (let i = 0; i < (content || []).length; i++) {
++    const c = content![i]
++    if (c.type === "text" || c.type === "reasoning") {
++      parts.push({ id: `${messageID}-${c.type}-${i}`, messageID, type: c.type, text: c.text ?? "" })
++      continue
++    }
++    if (c.type === "tool") {
++      parts.push({
++        id: `${messageID}-tool-${c.id || i}`,
++        messageID,
++        type: "tool",
++        tool: c.name,
++        callID: c.id,
++        state: mapToolState(c.state),
++        time: { start: c.time?.created, end: c.time?.completed },
++      })
++    }
++  }
++  return parts
++}
++
++// v2 projects a session timeline of typed messages (user / assistant / idle /
++// switch markers / ...). The chat UI only understands user+assistant messages
++// with parts, so markers are dropped and the rest reshaped. Input is expected
++// oldest-first (order=asc); output preserves that order.
++export function toMessageWithParts(messages: V2Message[]): MessageWithParts[] {
++  const out: MessageWithParts[] = []
++  for (const m of messages) {
++    if (m.type === "user") {
++      out.push({
++        info: {
++          id: m.id,
++          sessionID: m.sessionID ?? "",
++          role: "user",
++          time: { created: m.time?.created ?? 0 },
++          agent: m.agent,
++          model: m.model ? { providerID: m.model.providerID, modelID: m.model.id } : undefined,
++        },
++        parts: userParts(m.id, m),
++      })
++      continue
++    }
++    if (m.type === "assistant") {
++      out.push({
++        info: {
++          id: m.id,
++          sessionID: m.sessionID ?? "",
++          role: "assistant",
++          time: { created: m.time?.created ?? 0, completed: m.time?.completed },
++          agent: m.agent,
++          modelID: m.model?.id,
++          providerID: m.model?.providerID,
++          cost: m.cost,
++          tokens: m.tokens
++            ? {
++                input: m.tokens.input,
++                output: m.tokens.output,
++                reasoning: m.tokens.reasoning,
++                cache: m.tokens.cache,
++              }
++            : undefined,
++          error: m.error ? { message: structuredErrorMessage(m.error) } : undefined,
++          finish: m.finish,
++        },
++        parts: assistantParts(m.id, m.content),
++      })
++    }
++    // idle / agent-switched / model-switched / compaction / system / synthetic
++    // / shell / skill markers carry no chat content - skipped.
++  }
++  return out
++}
++
++export function toPermissionRequest(req: V2PermissionRequest) {
++  return {
++    id: req.id,
++    sessionID: req.sessionID,
++    permission: req.action,
++    patterns: req.resources || [],
++    metadata: req.metadata || {},
++    tool: req.source?.type === "tool" && req.source.messageID ? { messageID: req.source.messageID, callID: req.source.id ?? "" } : undefined,
++  }
++}
++
++// Fields that actually render as questions (external fields have no UI here);
++// the same filtered list keys the answer mapping so indices stay aligned.
++function answerFields(fields: V2FormField[]): V2FormField[] {
++  return (fields || []).filter((f) => f.type !== "external")
++}
++
++export function toQuestionRequest(form: V2FormInfo) {
++  const questions = answerFields(form.fields).map((f) => {
++    const options = (f.options || []).map((o) => ({ label: o.label || o.value, description: o.description || "" }))
++    if (f.type === "boolean") {
++      return {
++        question: f.description || f.title || f.key,
++        header: f.title || f.key,
++        options: [
++          { label: "Yes", description: "" },
++          { label: "No", description: "" },
++        ],
++        multiple: false,
++        custom: false,
++      }
++    }
++    const hasOptions = options.length > 0
++    return {
++      question: f.description || f.title || f.key,
++      header: f.title || f.key,
++      options,
++      multiple: f.type === "multiselect",
++      custom: f.custom !== false && (f.type === "string" || f.type === "number" || f.type === "integer" || !hasOptions),
++    }
++  })
++  return {
++    id: form.id,
++    sessionID: form.sessionID,
++    questions,
++    tool: undefined,
++  }
++}
++
++// Map QuestionPrompt's label-based answers back to v2's keyed Form.Answer.
++export function formAnswerFromFields(fields: V2FormField[] | undefined, answers: string[][]): Record<string, unknown> {
++  const answer: Record<string, unknown> = {}
++  for (let i = 0; i < (fields || []).length; i++) {
++    const f = fields![i]
++    const selected = answers[i] || []
++    const valueOf = (label: string): string => {
++      const opt = (f.options || []).find((o) => (o.label || o.value) === label)
++      return opt ? opt.value : label
++    }
++    if (selected.length === 0) continue
++    if (f.type === "multiselect") {
++      answer[f.key] = selected.map(valueOf)
++    } else if (f.type === "boolean") {
++      answer[f.key] = selected[0] === "Yes" || selected[0] === "true"
++    } else if (f.type === "number" || f.type === "integer") {
++      const n = Number(selected[0])
++      if (!Number.isNaN(n)) answer[f.key] = n
++    } else {
++      answer[f.key] = valueOf(selected[0])
++    }
++  }
++  return answer
++}
++
++export function toAgent(a: V2AgentInfo): Agent {
++  return {
++    name: a.id,
++    description: a.description,
++    mode: a.mode,
++    hidden: a.hidden,
++    color: a.color,
++    model: a.model ? { modelID: a.model.id, providerID: a.model.providerID } : undefined,
++    options: {},
++    steps: a.steps,
++  }
++}
++
++export function toCommand(c: V2CommandInfo): Command {
++  return { name: c.name, description: c.description, template: "", hints: [], mcp: false }
++}
++
++export function toProject(p: V2ProjectInfo): Project {
++  return { id: p.id, name: p.canonical, path: { cwd: p.canonical, root: p.canonical, absolute: p.canonical } }
++}
++
++export function toFileEntries(location: V2LocationRef | undefined, entries: V2FsEntry[]): FileEntry[] {
++  const base = location?.directory ?? ""
++  return entries.map((e) => ({
++    name: e.path.split("/").filter(Boolean).pop() || e.path,
++    path: e.path,
++    absolute: e.path.startsWith("/") ? e.path : `${base}/${e.path}`.replace(/\/{2,}/g, "/"),
++    type: e.type,
++    ignored: false,
++  }))
++}
++
++// v2 splits providers and models across two endpoints; rebuild the v1-style
++// catalog object ModelPicker/VariantPicker consume.
++export function toProviderCatalog(
++  providers: V2ProviderInfo[],
++  models: V2ModelInfo[],
++  defaultModel: V2ModelInfo | null,
++): {
++  all: Array<{ id: string; name: string; models: Record<string, any> }>
++  default: Record<string, string>
++  connected: string[]
++} {
++  const byProvider = new Map<string, { id: string; name: string; models: Record<string, any> }>()
++  for (const p of providers || []) {
++    byProvider.set(p.id, { id: p.id, name: p.name, models: {} })
++  }
++  const connected = new Set<string>()
++  for (const m of models || []) {
++    if (!byProvider.has(m.providerID)) {
++      byProvider.set(m.providerID, { id: m.providerID, name: m.providerID, models: {} })
++    }
++    if (m.enabled === false) continue
++    connected.add(m.providerID)
++    const entry = byProvider.get(m.providerID)!
++    const variants: Record<string, { reasoningEffort?: string }> = {}
++    for (const v of m.variants || []) {
++      variants[v.id] = { reasoningEffort: v.settings?.reasoning?.effort }
++    }
++    entry.models[m.id] = {
++      id: m.id,
++      name: m.name || m.modelID,
++      attachment: (m.capabilities?.input || []).includes("image"),
++      reasoning:
++        (m.capabilities?.input || []).includes("reasoning") ||
++        (m.variants || []).some((v) => v.settings?.reasoning && v.settings.reasoning.enabled !== false),
++      tool_call: Boolean(m.capabilities?.tools),
++      cost: m.cost?.[0] ? { input: m.cost[0].input, output: m.cost[0].output } : undefined,
++      limit: { context: m.limit?.context ?? 0, output: m.limit?.output ?? 0 },
++      status: m.status,
++      variants: Object.keys(variants).length > 0 ? variants : undefined,
++    }
++  }
++  const defaultByProvider: Record<string, string> = {}
++  if (defaultModel) defaultByProvider[defaultModel.providerID] = defaultModel.id
++  return {
++    all: Array.from(byProvider.values()).filter((p) => Object.keys(p.models).length > 0),
++    default: defaultByProvider,
++    connected: Array.from(connected),
++  }
++}
++
++// --- SSE event translation -----------------------------------------------------
++// v2 streams typed execution events (session.text.delta, session.tool.called,
++// ...) scoped by assistantMessageID. The app's stores consume the v1 taxonomy
++// (message.updated / message.part.updated / session.status / ...), so the
++// translator accumulates streamed content client-side and re-emits it as
++// part/message updates. Docs: docs/v2-api-map.md "Event taxonomy".
++
++function ev(type: string, properties: Record<string, unknown>): Event {
++  return { type, properties }
++}
++
++interface ToolBuf {
++  sessionID: string
++  messageID: string
++  name: string
++  input: string
++  start?: number
++}
++
++export class V2EventTranslator {
++  private assistants = new Map<string, Message>()
++  private textBuf = new Map<string, string>()
++  private reasoningBuf = new Map<string, string>()
++  private tools = new Map<string, ToolBuf>()
++
++  reset(): void {
++    this.assistants.clear()
++    this.textBuf.clear()
++    this.reasoningBuf.clear()
++    this.tools.clear()
++  }
++
++  // Content events can arrive before session.step.started for a step; emit a
++  // synthesized message.updated the first time we see an assistantMessageID so
++  // the chat always has a message bubble to attach parts to.
++  private ensureAssistant(sessionID: string, messageID: string, created?: number): Event[] {
++    if (this.assistants.has(messageID)) return []
++    const msg: Message = {
++      id: messageID,
++      sessionID,
++      role: "assistant",
++      time: { created: created ?? Date.now() },
++    }
++    this.assistants.set(messageID, msg)
++    return [ev("message.updated", { info: msg })]
++  }
++
++  private assistantMessage(sessionID: string, messageID: string, created?: number): Message {
++    const existing = this.assistants.get(messageID)
++    if (existing) return existing
++    const msg: Message = {
++      id: messageID,
++      sessionID,
++      role: "assistant",
++      time: { created: created ?? Date.now() },
++    }
++    this.assistants.set(messageID, msg)
++    return msg
++  }
++
++  private partEvent(buf: Map<string, string>, key: string, part: Part): Event[] {
++    buf.set(key, buf.get(key) === undefined ? (part.text ?? "") : buf.get(key) + (part.text ?? ""))
++    part = { ...part, text: buf.get(key) }
++    return [ev("message.part.updated", { part })]
++  }
++
++  translate(raw: V2RawEvent): Event[] {
++    const d = raw.data || {}
++    const sessionID = d.sessionID as string | undefined
++
++    switch (raw.type) {
++      case "server.connected":
++      case "project.updated":
++      case "session.inbox.delivered":
++      case "session.viewed":
++      case "session.metadata.updated":
++      case "session.model.selected":
++      case "session.agent.selected":
++      case "session.usage.recorded":
++        return []
++
++      case "session.execution.started":
++        if (!sessionID) return []
++        return [ev("session.status", { sessionID, status: { type: "busy" } })]
++
++      case "session.execution.succeeded":
++      case "session.execution.interrupted":
++      case "session.execution.failed": {
++        if (!sessionID) return []
++        const out: Event[] = []
++        if (raw.type === "session.execution.failed") {
++          out.push(ev("session.error", { sessionID, error: { message: structuredErrorMessage(d.error) } }))
++        }
++        out.push(ev("session.status", { sessionID, status: { type: "idle" } }))
++        return out
++      }
++
++      case "session.error":
++        if (!sessionID) return []
++        return [ev("session.error", { sessionID, error: { message: structuredErrorMessage(d.error) } })]
++
++      case "session.step.started": {
++        if (!sessionID || !d.assistantMessageID) return []
++        const msg: Message = {
++          id: d.assistantMessageID,
++          sessionID,
++          role: "assistant",
++          time: { created: d.started ?? raw.created ?? Date.now() },
++          agent: d.agent,
++          modelID: d.model?.id,
++          providerID: d.model?.providerID,
++        }
++        this.assistants.set(msg.id, msg)
++        return [ev("message.updated", { info: msg })]
++      }
++
++      case "session.step.ended": {
++        if (!d.assistantMessageID) return []
++        const base = this.assistantMessage(sessionID ?? "", d.assistantMessageID, raw.created)
++        const msg: Message = {
++          ...base,
++          time: { ...base.time, completed: raw.created ?? Date.now() },
++          finish: d.finish,
++          cost: d.cost ?? base.cost,
++          tokens: d.tokens ? { input: d.tokens.input, output: d.tokens.output, reasoning: d.tokens.reasoning, cache: d.tokens.cache } : base.tokens,
++        }
++        this.assistants.set(msg.id, msg)
++        return [ev("message.updated", { info: msg })]
++      }
++
++      case "session.usage.updated": {
++        // Usage lands per-run; attribute it to the latest assistant message we
++        // synthesized for this session (what the token/cost UI reads).
++        if (!sessionID) return []
++        let latest: Message | undefined
++        for (const m of this.assistants.values()) {
++          if (m.sessionID === sessionID) latest = m
++        }
++        if (!latest) return []
++        const msg: Message = {
++          ...latest,
++          cost: d.cost ?? latest.cost,
++          tokens: d.tokens ? { input: d.tokens.input, output: d.tokens.output, reasoning: d.tokens.reasoning, cache: d.tokens.cache } : latest.tokens,
++        }
++        this.assistants.set(latest.id, msg)
++        return [ev("message.updated", { info: msg })]
++      }
++
++      case "session.text.started":
++      case "session.text.delta":
++      case "session.text.ended": {
++        if (!sessionID || !d.assistantMessageID) return []
++        const pre = this.ensureAssistant(sessionID, d.assistantMessageID, raw.created)
++        const key = `${d.assistantMessageID}|${d.ordinal ?? 0}`
++        if (raw.type === "session.text.started") {
++          if (!this.textBuf.has(key)) this.textBuf.set(key, "")
++          return [...pre, ev("message.part.updated", { part: { id: `text-${key}`, sessionID, messageID: d.assistantMessageID, type: "text", text: "" } })]
++        }
++        const chunk = raw.type === "session.text.delta" ? String(d.delta ?? "") : String(d.text ?? "")
++        const isEnd = raw.type === "session.text.ended"
++        const acc = (this.textBuf.get(key) ?? "") + chunk
++        this.textBuf.set(key, acc)
++        if (isEnd && d.text !== undefined) this.textBuf.set(key, String(d.text))
++        return [...pre, ev("message.part.updated", { part: { id: `text-${key}`, sessionID, messageID: d.assistantMessageID, type: "text", text: this.textBuf.get(key) } })]
++      }
++
++      case "session.reasoning.started":
++      case "session.reasoning.delta":
++      case "session.reasoning.ended": {
++        if (!sessionID || !d.assistantMessageID) return []
++        const pre = this.ensureAssistant(sessionID, d.assistantMessageID, raw.created)
++        const key = `${d.assistantMessageID}|${d.ordinal ?? 0}`
++        if (raw.type === "session.reasoning.started") {
++          if (!this.reasoningBuf.has(key)) this.reasoningBuf.set(key, "")
++          return [...pre, ev("message.part.updated", { part: { id: `reasoning-${key}`, sessionID, messageID: d.assistantMessageID, type: "reasoning", text: "" } })]
++        }
++        const chunk = raw.type === "session.reasoning.delta" ? String(d.delta ?? "") : String(d.text ?? "")
++        const acc = (this.reasoningBuf.get(key) ?? "") + chunk
++        this.reasoningBuf.set(key, acc)
++        if (raw.type === "session.reasoning.ended" && d.text !== undefined) this.reasoningBuf.set(key, String(d.text))
++        return [...pre, ev("message.part.updated", { part: { id: `reasoning-${key}`, sessionID, messageID: d.assistantMessageID, type: "reasoning", text: this.reasoningBuf.get(key) } })]
++      }
++
++      case "session.tool.input.started":
++      case "session.tool.input.delta":
++      case "session.tool.input.ended":
++      case "session.tool.called":
++      case "session.tool.progress":
++      case "session.tool.success":
++      case "session.tool.failed": {
++        if (!sessionID || !d.id || !d.assistantMessageID) return []
++        const pre = this.ensureAssistant(sessionID, d.assistantMessageID, raw.created)
++        let buf = this.tools.get(d.id)
++        if (!buf) {
++          buf = { sessionID, messageID: d.assistantMessageID, name: d.name ?? "tool", input: "" }
++          this.tools.set(d.id, buf)
++        }
++        if (d.name) buf.name = d.name
++        if (raw.type === "session.tool.input.delta") buf.input += String(d.delta ?? "")
++        if (raw.type === "session.tool.input.ended" && d.text !== undefined) buf.input = String(d.text)
++
++        let state: Part["state"]
++        if (raw.type === "session.tool.success") {
++          state = { status: "completed", input: parsedToolInput(buf), output: toolOutput(d.content), title: typeof d.metadata?.title === "string" ? d.metadata.title : undefined, time: { start: buf.start, end: raw.created } }
++        } else if (raw.type === "session.tool.failed") {
++          state = { status: "error", input: parsedToolInput(buf), output: toolOutput(d.content), error: { message: structuredErrorMessage(d.error) }, time: { start: buf.start, end: raw.created } }
++        } else {
++          state = { status: "running", input: raw.type === "session.tool.called" ? d.input : parsedToolInput(buf), title: typeof d.metadata?.title === "string" ? d.metadata.title : undefined, time: { start: buf.start } }
++        }
++        if (raw.type === "session.tool.called") buf.start = buf.start ?? raw.created
++        const part: Part = { id: `tool-${d.id}`, sessionID, messageID: d.assistantMessageID, type: "tool", tool: buf.name, callID: d.id, state }
++        return [...pre, ev("message.part.updated", { part })]
++      }
++
++      case "session.inbox.enqueued": {
++        // The projected user message id equals the inbox item id (verified live),
++        // so emitting it here resolves the app's optimistic `temp-` message.
++        if (!sessionID || !d.inboxID) return []
++        const item = d.item || {}
++        const info: Message = {
++          id: d.inboxID,
++          sessionID,
++          role: "user",
++          time: { created: raw.created ?? Date.now() },
++        }
++        const out: Event[] = [ev("message.updated", { info })]
++        for (const part of userParts(d.inboxID, item.payload || item)) {
++          out.push(ev("message.part.updated", { part }))
++        }
++        return out
++      }
++
++      case "session.inbox.cancelled":
++        if (!sessionID || !d.inboxID) return []
++        return [ev("message.removed", { sessionID, messageID: d.inboxID })]
++
++      case "session.created": {
++        if (!d.id) return []
++        return [ev("session.created", { info: toSession(d as unknown as V2SessionInfo) })]
++      }
++
++      case "session.updated":
++      case "session.renamed":
++      case "session.moved":
++      case "session.forked": {
++        if (!d.id) return []
++        return [ev("session.updated", { info: toSession(d as unknown as V2SessionInfo) })]
++      }
++
++      case "permission.asked": {
++        if (!d.id || !d.sessionID) return []
++        rememberPermissionRequest(d as V2PermissionRequest)
++        return [ev("permission.asked", toPermissionRequest(d as V2PermissionRequest))]
++      }
++
++      case "permission.replied":
++      case "permission.rejected": {
++        if (!d.id) return []
++        const known = pendingRequestInfo(d.id)
++        forgetPendingRequest(d.id)
++        const sid = d.sessionID ?? known?.sessionID
++        if (!sid) return []
++        return [ev("permission.replied", { sessionID: sid, requestID: d.id })]
++      }
++
++      case "form.created": {
++        // v2 nests the form under `data.form` — unlike `permission.asked`, whose
++        // payload is the flat Permission.Request. Live-verified on v2.0.16
++        // (evt_0d4be7612002H8CTkutJnzghGX): data = {form: {id, sessionID, title, fields}}.
++        // Reading `d.id` here returns undefined, so the event was dropped silently
++        // and the question prompt never rendered.
++        const form = (d.form ?? d) as V2FormInfo
++        if (!form.id || !form.sessionID) return []
++        rememberForm(form)
++        return [ev("question.asked", toQuestionRequest(form))]
++      }
++
++      case "form.replied": {
++        if (!d.id) return []
++        const known = pendingRequestInfo(d.id)
++        forgetPendingRequest(d.id)
++        const sid = d.sessionID ?? known?.sessionID
++        if (!sid) return []
++        return [ev("question.replied", { sessionID: sid, requestID: d.id })]
++      }
++
++      case "form.cancelled": {
++        if (!d.id) return []
++        const known = pendingRequestInfo(d.id)
++        forgetPendingRequest(d.id)
++        const sid = d.sessionID ?? known?.sessionID
++        if (!sid) return []
++        return [ev("question.rejected", { sessionID: sid, requestID: d.id })]
++      }
++
++      default:
++        return []
++    }
++  }
++}
++
++function parsedToolInput(buf: ToolBuf): unknown {
++  if (!buf.input) return undefined
++  try {
++    return JSON.parse(buf.input)
++  } catch {
++    return buf.input
++  }
++}
+diff --git a/src/stores/connections.ts b/src/stores/connections.ts
+index 2fb33de..830a229 100644
+--- a/src/stores/connections.ts
++++ b/src/stores/connections.ts
+@@ -2,7 +2,8 @@ import { create } from "zustand"
+ import * as SecureStore from "expo-secure-store"
+ import * as Crypto from "expo-crypto"
+ import type { ServerConnection, ConnectionType } from "../lib/types"
+-import { createClient, type Client, type Project } from "../lib/sdk"
++import { createClient, probeServer, type Client, type Project } from "../lib/sdk"
++import type { ServerApi } from "../lib/api-detect"
+ import { addBreadcrumb } from "../lib/sentry"
+ import { AnalyticsEvent, classifyConnectionError, track, type ConnectionTestSource } from "../lib/analytics"
+ import { buildAuth } from "../lib/auth"
+@@ -23,6 +24,7 @@ const CONNECTION_TEST_TIMEOUT_MS = 12_000
+ interface ClientBase {
+   baseUrl: string
+   auth?: { username: string; password: string }
++  api?: ServerApi
+ }
+ 
+ interface ConnectionsState {
+@@ -47,7 +49,7 @@ interface ConnectionsState {
+     connection: ServerConnection,
+     source: ConnectionTestSource,
+     password?: string,
+-  ) => Promise<{ ok: boolean; error?: string }>
++  ) => Promise<{ ok: boolean; api?: ServerApi; serverVersion?: string; error?: string }>
+   updateConnection: (id: string, updates: Partial<ServerConnection>, password?: string) => Promise<void>
+   refreshProject: () => Promise<void>
+   // Create a one-off client pointing at a specific directory (for cross-project operations).
+@@ -67,12 +69,33 @@ function buildClient(
+   url: string,
+   directory?: string,
+   auth?: { username: string; password: string },
++  api?: ServerApi,
+ ): { client: Client; base: ClientBase } {
+-  const base: ClientBase = { baseUrl: url, auth }
+-  const client = createClient({ baseUrl: url, directory, auth })
++  const base: ClientBase = { baseUrl: url, auth, api }
++  const client = createClient({ baseUrl: url, directory, auth, api })
+   return { client, base }
+ }
+ 
++// Decide which transport a connection needs. A recorded probe is reused; a
++// connection saved before this existed (or saved while the server was down) is
++// probed once here and the answer is written back onto the stored record. When
++// the probe cannot classify the server we keep the previous behaviour (v2)
++// instead of refusing to load a connection the user can still see and edit.
++async function resolveApi(
++  connection: ServerConnection,
++  auth?: { username: string; password: string },
++): Promise<{ api?: ServerApi; resolved: boolean }> {
++  if (connection.api) return { api: connection.api, resolved: false }
++  try {
++    const identity = await probeServer({ baseUrl: connection.url, directory: connection.directory, auth })
++    connection.api = identity.api
++    connection.serverVersion = identity.version
++    return { api: identity.api, resolved: true }
++  } catch {
++    return { api: undefined, resolved: false }
++  }
++}
++
+ export const useConnections = create<ConnectionsState>((set, get) => ({
+   connections: [],
+   activeConnection: null,
+@@ -105,9 +128,13 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+       if (active) {
+         const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
+         const auth = buildAuth(active.username, password)
+-        const built = buildClient(active.url, active.directory, auth)
++        const { api, resolved } = await resolveApi(active, auth)
++        const built = buildClient(active.url, active.directory, auth, api)
+         client = built.client
+         base = built.base
++        // Persist a probe that was only just discovered, so the next launch
++        // picks the same transport without probing again.
++        if (resolved) await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+         // Fetch current project info and server paths
+         try {
+           const [proj, paths] = await Promise.all([
+@@ -164,7 +191,8 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+     if (newConnection.active) {
+       activeConnection = newConnection
+       const auth = buildAuth(newConnection.username, password)
+-      const built = buildClient(newConnection.url, newConnection.directory, auth)
++      const { api } = await resolveApi(newConnection, auth)
++      const built = buildClient(newConnection.url, newConnection.directory, auth, api)
+       client = built.client
+       base = built.base
+ 
+@@ -202,7 +230,9 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+         await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+         const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${newActive.id}`)
+         const auth = buildAuth(newActive.username, password)
+-        const built = buildClient(newActive.url, newActive.directory, auth)
++        const { api, resolved } = await resolveApi(newActive, auth)
++        const built = buildClient(newActive.url, newActive.directory, auth, api)
++        if (resolved) await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+         set({ connections, activeConnection: newActive, client: built.client, clientBase: built.base })
+       } else {
+         set({ connections, activeConnection: null, client: null, clientBase: null })
+@@ -229,7 +259,8 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+     if (active) {
+       const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
+       const auth = buildAuth(active.username, password)
+-      const built = buildClient(active.url, active.directory, auth)
++      const { api } = await resolveApi(active, auth)
++      const built = buildClient(active.url, active.directory, auth, api)
+       client = built.client
+       base = built.base
+ 
+@@ -260,15 +291,21 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+   testConnection: async (connection, source, password) => {
+     track(AnalyticsEvent.ConnectionAttempted, { source })
+     try {
++      const auth = buildAuth(connection.username, password)
++      // Probe before anything else. Against a v1 server the v2 health route is not
++      // a route at all — it falls through to the web SPA and answers 200 with HTML,
++      // which used to read as "connected" and then failed on every real request.
++      const identity = await probeServer({ baseUrl: connection.url, directory: connection.directory, auth })
+       const client = createClient({
+         baseUrl: connection.url,
+         directory: connection.directory,
+-        auth: buildAuth(connection.username, password),
++        auth,
++        api: identity.api,
+       })
+ 
+       await client.global.health(CONNECTION_TEST_TIMEOUT_MS)
+       track(AnalyticsEvent.ConnectionSucceeded, { source })
+-      return { ok: true }
++      return { ok: true, api: identity.api, serverVersion: identity.version }
+     } catch (error) {
+       const message = error instanceof Error ? error.message : String(error)
+       track(AnalyticsEvent.ConnectionFailed, { source, error_class: classifyConnectionError(message) })
+@@ -277,7 +314,18 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+   },
+ 
+   updateConnection: async (id, updates, password) => {
+-    const connections = get().connections.map((c) => (c.id === id ? { ...c, ...updates } : c))
++    const connections = get().connections.map((c) => {
++      if (c.id !== id) return c
++      const merged = { ...c, ...updates }
++      // A different URL is a different server: drop the recorded probe so the
++      // next client build re-detects the transport instead of reusing the
++      // previous server's answer.
++      if (updates.url !== undefined && updates.url !== c.url) {
++        merged.api = undefined
++        merged.serverVersion = undefined
++      }
++      return merged
++    })
+ 
+     await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+ 
+@@ -294,7 +342,9 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+       const active = connections.find((c) => c.id === id)!
+       const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${id}`)
+       const auth = buildAuth(active.username, password)
+-      const built = buildClient(active.url, active.directory, auth)
++      const { api, resolved } = await resolveApi(active, auth)
++      const built = buildClient(active.url, active.directory, auth, api)
++      if (resolved) await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+       try {
+         const [project, paths] = await Promise.all([
+           built.client.project.current().catch(() => null),
+@@ -340,7 +390,7 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
+     // Reuse current client if directory matches
+     const active = get().activeConnection
+     if (active?.directory === directory) return get().client
+-    return createClient({ baseUrl: base.baseUrl, directory, auth: base.auth })
++    return createClient({ baseUrl: base.baseUrl, directory, auth: base.auth, api: base.api })
+   },
+ 
+   switchDirectory: async (directory) => {
+diff --git a/src/stores/events.ts b/src/stores/events.ts
+index c53a848..b4c8d1e 100644
+--- a/src/stores/events.ts
++++ b/src/stores/events.ts
+@@ -57,6 +57,11 @@ interface EventsState {
+ 
+   connect: () => void
+   disconnect: () => void
++  // Force an immediate reconnect + full resync, bypassing the backoff loop.
++  // Called when the app returns to the foreground: Android freezes JS timers
++  // and usually kills the SSE socket while backgrounded, so the backoff
++  // timers that were scheduled never ran and the stream is stale.
++  reconnectNow: () => void
+ }
+ 
+ let controller: AbortController | null = null
+@@ -77,7 +82,9 @@ const PROLONGED_DISCONNECT_MS = 30_000
+ // optimistic removals.
+ export async function refreshPending(client: Client, sessionID: string) {
+   try {
+-    const [perms, questions] = await Promise.all([client.permission.list(), client.question.list()])
++    // v2 permission/form lists are session-scoped — pass the session so
++    // pending prompts are found regardless of the server's active location.
++    const [perms, questions] = await Promise.all([client.permission.list(sessionID), client.question.list(sessionID)])
+     const sessionPerms = (perms || []).filter((p: Record<string, unknown>) => p.sessionID === sessionID)
+     const sessionQuestions = (questions || []).filter((q: Record<string, unknown>) => q.sessionID === sessionID)
+     useEvents.setState((state) => ({
+@@ -479,6 +486,34 @@ export const useEvents = create<EventsState>((set, get) => ({
+     })()
+   },
+ 
++  reconnectNow: () => {
++    const connState = useConnections.getState()
++    if (!connState.client) return
++    console.log("[SSE] Foreground reconnect — re-establishing event stream")
++    if (reconnectTimer) {
++      clearTimeout(reconnectTimer)
++      reconnectTimer = null
++    }
++    controller?.abort()
++    controller = null
++    // Reset backoff state first: connect() gates its post-reconnect busy
++    // resync on reconnectAttempts > 0, and a foreground resume must resync
++    // even from a previously "stable" (but actually dead) connection — so we
++    // run the resync explicitly below instead.
++    set({ reconnectAttempts: 0, lastDisconnectAt: null })
++    get().connect()
++    void resyncBusySessions()
++    const sessions = useSessions.getState()
++    if (sessions.currentSession) {
++      sessions.refreshMessages()
++      const session = sessions.currentSession
++      const client = session.directory
++        ? connState.clientForDirectory(session.directory) ?? connState.client
++        : connState.client
++      if (client) void refreshPending(client, session.id)
++    }
++  },
++
+   disconnect: () => {
+     console.log("[SSE] Disconnecting")
+     addBreadcrumb({ category: "sse", message: "disconnected" })

@@ -12,18 +12,24 @@ on:
 
 # ─── Where the app source comes from ──────────────────────────────────────────
 #
-# This block is the switch. opencode-mobile's v2 client (routes under /api/,
-# {data,cursor} envelopes, its own SSE format) lives in upstream PR #209 and is
-# not merged, so we track a branch on our own fork that carries that commit
-# verbatim. Once #209 lands upstream, set UPSTREAM_REF to main and delete the
-# fork — nothing else in this file needs to change.
+# This block is the switch.
+#
+# opencode-mobile's v2 client (routes under /api/, {data,cursor} envelopes, its
+# own SSE format) lives in upstream PR #209 and is still unmerged, so the patch
+# that adds it is vendored here as src/upstream-v2/v2-client.patch and applied
+# on top of the clone. See src/upstream-v2/README.md for why it is vendored
+# rather than tracked on a fork.
+#
+# When #209 lands upstream: set UPSTREAM_V2_OVERLAY to "" and nothing else here
+# changes — the apply step skips itself.
 #
 # UPSTREAM_REF may be a branch or a tag. The build is keyed on the resolved
-# commit, not on the ref name, so moving the branch forward triggers a rebuild
-# on the next scheduled run.
+# commit *plus* a hash of the overlay, so moving upstream forward, or editing
+# the overlay, both trigger a rebuild.
 env:
-  UPSTREAM_REPO: Gegaremant/opencode-mobile
-  UPSTREAM_REF: v2
+  UPSTREAM_REPO: dzianisv/opencode-mobile
+  UPSTREAM_REF: main
+  UPSTREAM_V2_OVERLAY: src/upstream-v2/v2-client.patch
   # Android refuses to install over an equal or lower versionCode, so this has
   # to grow with every shipped APK. Bump by hand; it is the only manual step.
   RU_VERSION_CODE: "44"
@@ -44,28 +50,53 @@ jobs:
         id: source
         run: |
           set -euo pipefail
-          SHA=$(git ls-remote "https://github.com/${{ env.UPSTREAM_REPO }}.git" \
-            "refs/heads/${{ env.UPSTREAM_REF }}" "refs/tags/${{ env.UPSTREAM_REF }}" \
-            | awk '{print $1}' | head -1)
+          # `git ls-remote` exits 128 on a missing/unreachable repo, and with
+          # `set -e` that kills the step before the message below can print —
+          # which is exactly what happened while the build pointed at a fork
+          # that had stopped answering. Check the exit status explicitly.
+          if ! SHA=$(git ls-remote "https://github.com/${{ env.UPSTREAM_REPO }}.git" \
+              "refs/heads/${{ env.UPSTREAM_REF }}" "refs/tags/${{ env.UPSTREAM_REF }}" 2>&1); then
+            echo "ERROR: cannot reach ${{ env.UPSTREAM_REPO }} at ref '${{ env.UPSTREAM_REF }}'"
+            echo "$SHA"
+            exit 1
+          fi
+          SHA=$(printf '%s\n' "$SHA" | awk '{print $1}' | head -1)
           [ -n "$SHA" ] || { echo "ERROR: ${{ env.UPSTREAM_REF }} not found in ${{ env.UPSTREAM_REPO }}"; exit 1; }
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Source: ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_REF }} -> $SHA"
+
+          # Part of the build identity: editing the overlay has to rebuild even
+          # when upstream stands still. "none" when there is no overlay, i.e.
+          # once v2 is upstream.
+          OVERLAY="${{ env.UPSTREAM_V2_OVERLAY }}"
+          if [ -n "$OVERLAY" ]; then
+            [ -f "$OVERLAY" ] || { echo "ERROR: overlay not found: $OVERLAY"; exit 1; }
+            OVERLAY_ID=$(sha256sum "$OVERLAY" | cut -c1-12)
+            OVERLAY_FLAG=".v2"
+          else
+            OVERLAY_ID=none
+            OVERLAY_FLAG=""
+          fi
+          echo "overlay=$OVERLAY_ID" >> "$GITHUB_OUTPUT"
+          echo "overlay_flag=$OVERLAY_FLAG" >> "$GITHUB_OUTPUT"
+          echo "Source: ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_REF }} -> $SHA (overlay: $OVERLAY_ID)"
 
       - name: Check if already synced
         id: check_sync
         run: |
           set -euo pipefail
-          # Keyed on the commit, so a branch that moved rebuilds and an unchanged
-          # one does not. `force` re-runs a build whose output we already have.
+          # Keyed on the commit plus the overlay hash, so moving upstream forward
+          # or editing the overlay rebuilds, and an unchanged pair does not.
+          # `force` re-runs a build whose output we already have.
+          KEY="${{ steps.source.outputs.sha }}-${{ steps.source.outputs.overlay }}"
           if [ "${{ inputs.force }}" = "true" ]; then
             echo "already_synced=false" >> "$GITHUB_OUTPUT"
             echo "force requested — rebuilding regardless of sync marker"
-          elif git tag -l "synced-${{ steps.source.outputs.sha }}" | grep -q .; then
+          elif git tag -l "synced-$KEY" | grep -q .; then
             echo "already_synced=true" >> "$GITHUB_OUTPUT"
-            echo "Already built ${{ steps.source.outputs.sha }}, skipping."
+            echo "Already built $KEY, skipping."
           else
             echo "already_synced=false" >> "$GITHUB_OUTPUT"
-            echo "New commit: ${{ steps.source.outputs.sha }}"
+            echo "New build: $KEY"
           fi
 
       - name: Setup Node.js
@@ -109,6 +140,26 @@ jobs:
           git -C original-src fetch --depth 1 origin "${{ steps.source.outputs.sha }}"
           git -C original-src checkout --detach FETCH_HEAD
           echo "checked out $(git -C original-src rev-parse HEAD)"
+
+      - name: Apply the vendored v2 client
+        if: steps.check_sync.outputs.already_synced == 'false'
+        run: |
+          set -euo pipefail
+          OVERLAY="${{ env.UPSTREAM_V2_OVERLAY }}"
+          if [ -z "$OVERLAY" ]; then
+            echo "no overlay configured — building upstream as-is"
+            exit 0
+          fi
+          git -C original-src apply --verbose "$OVERLAY"
+          # Fail here, loudly, rather than 20 minutes later at the APK check:
+          # every symptom downstream is "the app cannot talk to a v2 server".
+          for MARKER in src/lib/api-detect.ts src/lib/v2-shape.ts src/lib/sdk-v1.ts; do
+            [ -f "original-src/$MARKER" ] || {
+              echo "ERROR: overlay applied but $MARKER is missing — v2 client is not in this build"
+              exit 1
+            }
+          done
+          echo "v2 client overlay applied and verified"
 
       - name: Apply Russian locale patch
         if: steps.check_sync.outputs.already_synced == 'false'
@@ -188,16 +239,17 @@ jobs:
           node src/patches/patch-diagnostics.js "$SRC"
 
           # 16. Stamp our own version + versionCode.
-          #     The version name comes from upstream's app.json (so the release
-          #     reads as "the RU build of 0.4.15") with the branch appended, and
-          #     versionCode is ours to raise — Android refuses to install over
-          #     an equal or lower one, so shipping a rebuild of the same
-          #     upstream version without bumping it would be un-installable.
+          #     The version name is upstream's app.json plus "-ru", with "v2"
+          #     appended exactly when the v2 overlay is in play — that is the
+          #     thing a user needs to see, not which branch we cloned. versionCode
+          #     is ours to raise: Android refuses to install over an equal or
+          #     lower one, so shipping a rebuild of the same upstream version
+          #     without bumping it would be un-installable.
+          SUFFIX="ru${{ steps.source.outputs.overlay_flag }}"
           node -e "
             const fs = require('fs');
             const app = JSON.parse(fs.readFileSync('$SRC/app.json', 'utf8'));
-            const base = app.expo.version;
-            app.expo.version = base + '-ru.${{ env.UPSTREAM_REF }}';
+            app.expo.version = app.expo.version + '-${SUFFIX}';
             app.expo.android.versionCode = Number('${{ env.RU_VERSION_CODE }}');
             fs.writeFileSync('$SRC/app.json', JSON.stringify(app, null, 2) + '\n');
             console.log('version:', app.expo.version, 'versionCode:', app.expo.android.versionCode);
@@ -421,7 +473,6 @@ jobs:
       - name: Mark as synced
         if: steps.check_sync.outputs.already_synced == 'false'
         run: |
-          # Keyed on the commit, matching check_sync. Marking it on the ref name
-          # would make a moving branch look "already built" forever.
-          git tag "synced-${{ steps.source.outputs.sha }}"
-          git push origin "synced-${{ steps.source.outputs.sha }}"
+          # Keyed on the commit plus the overlay hash, matching check_sync.
+          git tag "synced-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.overlay }}"
+          git push origin "synced-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.overlay }}"
