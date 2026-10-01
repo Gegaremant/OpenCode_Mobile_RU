@@ -150,7 +150,9 @@ jobs:
             echo "no overlay configured — building upstream as-is"
             exit 0
           fi
-          git -C original-src apply --verbose "$OVERLAY"
+          # Absolute: `git -C original-src` resolves a relative path against
+          # original-src, not the workspace root where the patch actually lives.
+          git -C original-src apply --verbose "$GITHUB_WORKSPACE/$OVERLAY"
           # Fail here, loudly, rather than 20 minutes later at the APK check:
           # every symptom downstream is "the app cannot talk to a v2 server".
           for MARKER in src/lib/api-detect.ts src/lib/v2-shape.ts src/lib/sdk-v1.ts; do
