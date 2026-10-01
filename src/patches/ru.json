@@ -281,7 +281,9 @@
       "confirmMessage": "Чатов затронуто: {{count}}.",
       "alerts": {
         "partialTitle": "Завершено с ошибками",
-        "partialMessage": "Готово: {{done}}, с ошибкой: {{failed}}."
+        "partialMessage": "Готово: {{done}}, с ошибкой: {{failed}}.",
+        "unsupportedTitle": "Сервер не поддерживает",
+        "unsupportedMessage": "В API v2 этого сервера нет эндпоинта для архивирования чатов. Архив работает на серверах opencode 1.x."
       }
     },
     "export": {

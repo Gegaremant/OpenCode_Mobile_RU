@@ -25,6 +25,16 @@ const path = require("path")
 //      padded by the hook,
 //   3. gives the two connection forms (which never had any avoidance at all)
 //      a content inset so their last field/button can clear the keyboard.
+//
+// Two upstream generations, one patch. Step 2 only applies to the v1 client
+// (opencode-mobile <= 0.4.x), whose session screen imports KeyboardAvoidingView
+// from react-native core. The v2 client swapped that import for
+// react-native-keyboard-controller and passes `automaticOffset`, which reads
+// the real IME inset from WindowInsets — upstream fixed the very thing this
+// patch fixes, properly. Replacing that with a plain View padded by a
+// JS-measured height would double-pad against an already-correct component, so
+// on the v2 tree step 2 is skipped and only the hook survives (the connection
+// forms are still bare ScrollViews there too, so step 3 keeps applying).
 
 const TARGET = process.argv[2]
 if (!TARGET) {
@@ -126,6 +136,14 @@ function replaceRegexOnce(haystack, regex, replacement, label, rel) {
 const sessionRel = "app/session/[id].tsx"
 let session = read(sessionRel)
 
+// The v2 client already avoids the keyboard with native insets
+// (react-native-keyboard-controller + automaticOffset). Detect it by the import
+// and leave that screen alone; only the forms below still need our inset.
+if (session.includes('import { KeyboardAvoidingView } from "react-native-keyboard-controller"')) {
+  console.log(sessionRel + ": upstream uses react-native-keyboard-controller, keyboard avoidance left as-is")
+  session = null
+} else {
+
 // KeyboardAvoidingView and Platform are both unused once the tag is gone.
 session = replaceOnce(
   session,
@@ -165,6 +183,8 @@ session = replaceOnce(session, "      </KeyboardAvoidingView>\n", "      </View>
 
 write(sessionRel, session)
 console.log(sessionRel + ": composer now clears the keyboard")
+
+}
 
 // --- app/connection/add.tsx + app/connection/[id].tsx ------------------------
 

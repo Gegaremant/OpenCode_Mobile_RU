@@ -21,6 +21,25 @@ const path = require("path")
 // out of the server's own default listing, but every client that filters on
 // `time.archived` truthiness — this app, the TUI — treats it as active again).
 // setSessionArchived() therefore documents the trade-off at the one call site.
+//
+// --- v2 (opencode /api/* rewrite) --------------------------------------------
+//
+// The v2 surface answers both halves differently, verified against the route
+// definitions in anomalyco/opencode (packages/protocol/src/groups/session.ts):
+//
+//   * LISTING still works. `GET /api/session` takes no `archived` parameter and
+//     applies no archive filter of its own (the v2 list query is workspace /
+//     limit / order / search / directory / project / subpath / cursor), so it
+//     returns active *and* archived rows in one response — `time.archived` is
+//     still part of the v2 Session.Info schema. Filtering client-side is
+//     therefore both necessary and sufficient, and the `?archived=true` query
+//     stays a v1-only detail.
+//
+//   * WRITING does not work. The v2 endpoint table has `GET /api/session/:id`
+//     and nothing else — no PATCH — so there is no call that could set the
+//     flag. The archive actions stay visible and report this honestly instead
+//     of pretending to work; archiveIsSupported() is the single place that
+//     decides, and the UI keys off the connection's probed `api`.
 
 const TARGET = process.argv[2]
 if (!TARGET) {
@@ -59,7 +78,38 @@ export function splitArchived(sessions: Session[]): { active: Session[]; archive
   return { active, archived }
 }
 
-export async function setSessionArchived(client: Client, sessionID: string, archived: boolean): Promise<void> {
+/**
+ * Whether this connection's server can record the archive flag.
+ *
+ * "v1" (and an unprobed connection, which the client treats as v2 today) can:
+ * \`PATCH /session/:id\` takes \`time.archived\`. "v2" cannot — its route table
+ * has \`GET /api/session/:id\` and no PATCH, so no call exists that could set
+ * the flag. Reading is fine on both: v2 lists active and archived rows together
+ * and still reports \`time.archived\`.
+ *
+ * Declared as a plain string union rather than importing ServerApi, because
+ * src/lib/api-detect.ts only exists on the v2 client generation — this file has
+ * to compile against both.
+ */
+export function archiveIsSupported(api: string | undefined): boolean {
+  return api !== "v2"
+}
+
+/** Thrown instead of firing a request that cannot work. See archiveIsSupported. */
+export class ArchiveUnsupportedError extends Error {
+  constructor() {
+    super("The connected server's v2 API has no session-archive endpoint")
+    this.name = "ArchiveUnsupportedError"
+  }
+}
+
+export async function setSessionArchived(
+  client: Client,
+  sessionID: string,
+  archived: boolean,
+  api?: string,
+): Promise<void> {
+  if (!archiveIsSupported(api)) throw new ArchiveUnsupportedError()
   await client.session.update(sessionID, { time: { archived: archived ? Date.now() : UNARCHIVED } })
 }
 
@@ -357,34 +407,81 @@ list = replaceOnce(
 save(listRel, list)
 console.log(listRel + ": ?archived=true support")
 
-// --- src/lib/sdk.ts: forward that query -------------------------------------
+// --- the v1 transport: forward that query -----------------------------------
+//
+// The transport that talks /experimental/session moved between client
+// generations: src/lib/sdk.ts while the client only spoke v1, src/lib/sdk-v1.ts
+// once it grew a second transport. Patch whichever file carries the route.
 
-const sdkRel = "src/lib/sdk.ts"
-let sdk = read(sdkRel)
+const V1_LISTENERS = ["src/lib/sdk-v1.ts", "src/lib/sdk.ts"].filter((rel) =>
+  fs.existsSync(path.join(TARGET, rel)),
+)
 
-sdk = replaceOnce(
-  sdk,
-  `      list: (params?: { roots?: boolean; limit?: number; search?: string }): Promise<Session[]> =>
+const V1_LIST_OLD = `      list: (params?: { roots?: boolean; limit?: number; search?: string }): Promise<Session[]> =>
         loadSessionList(
           {
             getExperimental: async (): Promise<Session[] | null> => {
-              const response = await fetchWithTimeout(\`\${config.baseUrl}/experimental/session\`, {`,
-  `      list: (params?: { roots?: boolean; limit?: number; search?: string; archived?: boolean }): Promise<Session[]> =>
+              const response = await fetchWithTimeout(\`\${config.baseUrl}/experimental/session\`, {`
+
+const V1_LIST_NEW = `      list: (params?: { roots?: boolean; limit?: number; search?: string; archived?: boolean }): Promise<Session[]> =>
         loadSessionList(
           {
             getExperimental: async (query?: string): Promise<Session[] | null> => {
-              const response = await fetchWithTimeout(\`\${config.baseUrl}/experimental/session\${query ?? ""}\`, {`,
-  "session.list",
-  sdkRel,
-)
+              const response = await fetchWithTimeout(\`\${config.baseUrl}/experimental/session\${query ?? ""}\`, {`
 
-save(sdkRel, sdk)
-console.log(sdkRel + ": session.list forwards the archive query")
+const v1Rel = V1_LISTENERS.find((rel) => read(rel).includes(V1_LIST_OLD))
+if (!v1Rel) {
+  console.error("v1 session.list patch FAILED: marker not found in any of: " + V1_LISTENERS.join(", "))
+  process.exit(1)
+}
+
+save(
+  v1Rel,
+  replaceOnce(read(v1Rel), V1_LIST_OLD, V1_LIST_NEW, "session.list", v1Rel),
+)
+console.log(v1Rel + ": session.list forwards the archive query")
+
+// --- the v2 transport: accept the flag, ignore it ----------------------------
+//
+// GET /api/session applies no archive filter, so it already returns both sides
+// and the query would be meaningless — but the shared SessionListParams gained
+// `archived`, and the archive UI passes it on both generations. Widening the
+// signature keeps that call site type-clean and documents why it is dropped.
+
+const V2_LIST_OLD = `      list: (params?: { roots?: boolean; limit?: number; search?: string }): Promise<Session[]> =>
+        loadSessionList(
+          {
+            getExperimental: async (): Promise<Session[] | null> => {
+              const response = await fetchWithTimeout(\`\${config.baseUrl}/api/session?limit=500&order=desc\`, {`
+
+const V2_LIST_NEW = `      // \`archived\` is accepted for parity with the v1 transport and deliberately
+      // ignored: GET /api/session takes no archive filter and returns active and
+      // archived rows together, so the caller filters on time.archived itself.
+      list: (params?: { roots?: boolean; limit?: number; search?: string; archived?: boolean }): Promise<Session[]> =>
+        loadSessionList(
+          {
+            getExperimental: async (_query?: string): Promise<Session[] | null> => {
+              const response = await fetchWithTimeout(\`\${config.baseUrl}/api/session?limit=500&order=desc\`, {`
+
+const v2Rel = V1_LISTENERS.find((rel) => read(rel).includes(V2_LIST_OLD))
+if (v2Rel) {
+  save(
+    v2Rel,
+    replaceOnce(read(v2Rel), V2_LIST_OLD, V2_LIST_NEW, "v2 session.list", v2Rel),
+  )
+  console.log(v2Rel + ": session.list accepts (and ignores) archived — v2 needs no filter")
+}
 
 // --- app/(tabs)/index.tsx: the archive UI ------------------------------------
 
 const listRel2 = "app/(tabs)/index.tsx"
 let screen = read(listRel2)
+
+// ServerConnection.api only exists on the v2 client generation (it is written by
+// probeServer/api-detect). Referencing it on a v1-only tree would not compile, so
+// the expression is chosen per tree rather than guarded at runtime.
+const hasApiField = fs.existsSync(path.join(TARGET, "src", "lib", "api-detect.ts"))
+const SERVER_API_EXPR = hasApiField ? "activeConnection?.api" : "undefined"
 
 screen = replaceOnce(
   screen,
@@ -400,7 +497,7 @@ screen = replaceOnce(
   `import { nameOf } from "../../src/lib/path-utils"`,
   `import { nameOf } from "../../src/lib/path-utils"
 import { ActionSheet } from "../../src/components/ActionSheet"
-import { isArchived, setSessionArchived, shareTranscript, buildTranscript, type TranscriptLabels } from "../../src/lib/session-archive"`,
+import { archiveIsSupported, isArchived, setSessionArchived, shareTranscript, buildTranscript, type TranscriptLabels } from "../../src/lib/session-archive"`,
   "path-utils import",
   listRel2,
 )
@@ -607,10 +704,17 @@ screen = replaceOnce(
   `  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set())`,
   `  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set())
 
-  // Archive view. The server hides archived sessions from its default listing,
-  // so the archive is fetched separately (with archived=true, which disables
-  // that filter and therefore returns both sides) instead of piggy-backing on
-  // loadSessions(), whose pool is capped by \`limit\`.
+  // Archive view. On v1 the server hides archived sessions from its default
+  // listing, so the archive is fetched separately (with archived=true, which
+  // disables that filter and therefore returns both sides) instead of
+  // piggy-backing on loadSessions(), whose pool is capped by \`limit\`. On v2 the
+  // listing applies no archive filter at all, so the same call already returns
+  // both sides and the client-side isArchived() filter does the split.
+  //
+  // serverApi is the connection's probed API generation. It only exists on the
+  // v2 client (ServerConnection.api, set by api-detect); on the v1-only client
+  // every server predates the /api/ rewrite, so the value is pinned to undefined.
+  const serverApi: string | undefined = ${SERVER_API_EXPR}
   const [showArchived, setShowArchived] = useState(false)
   const [archivedSessions, setArchivedSessions] = useState<Session[]>([])
   const [archiveBusy, setArchiveBusy] = useState(false)
@@ -709,6 +813,15 @@ screen = replaceOnce(
   `  const runArchiveJob = useCallback(
     async (targets: Session[], archived: boolean) => {
       if (targets.length === 0 || archiveBusy) return
+      // v2 exposes no session-update endpoint, so there is nothing to call.
+      // Say so plainly instead of confirming a dialog whose action cannot work.
+      if (!archiveIsSupported(serverApi)) {
+        Alert.alert(
+          t("sessionsList.archive.alerts.unsupportedTitle"),
+          t("sessionsList.archive.alerts.unsupportedMessage"),
+        )
+        return
+      }
       const verb = archived ? t("sessionsList.archive.actions.archive") : t("sessionsList.archive.actions.restore")
       Alert.alert(
         t("sessionsList.archive.confirmTitle", { verb }),
@@ -727,7 +840,7 @@ screen = replaceOnce(
                   continue
                 }
                 try {
-                  await setSessionArchived(api, session.id, archived)
+                  await setSessionArchived(api, session.id, archived, serverApi)
                 } catch (err) {
                   console.error("Archive request failed:", err)
                   failed++
@@ -749,7 +862,7 @@ screen = replaceOnce(
         ],
       )
     },
-    [archiveBusy, clientFor, refreshBoth, t],
+    [archiveBusy, clientFor, refreshBoth, serverApi, t],
   )
 
   const handleArchive = useCallback(
@@ -986,6 +1099,9 @@ const STRINGS = {
     confirmMessage: "Chats affected: {{count}}.",
     partialTitle: "Finished with errors",
     partialMessage: "Done: {{done}}, failed: {{failed}}.",
+    unsupportedTitle: "Not available on this server",
+    unsupportedMessage:
+      "This server's v2 API has no endpoint for archiving chats. Archiving works on opencode 1.x servers.",
     copiedTitle: "Transcript copied",
     copiedMessage: "The conversation is on the clipboard.",
     exportFailedTitle: "Export failed",
@@ -1010,6 +1126,9 @@ const STRINGS = {
     confirmMessage: "Чатов затронуто: {{count}}.",
     partialTitle: "Завершено с ошибками",
     partialMessage: "Готово: {{done}}, с ошибкой: {{failed}}.",
+    unsupportedTitle: "Сервер не поддерживает",
+    unsupportedMessage:
+      "В API v2 этого сервера нет эндпоинта для архивирования чатов. Архив работает на серверах opencode 1.x.",
     copiedTitle: "Переписка скопирована",
     copiedMessage: "Текст диалога в буфере обмена.",
     exportFailedTitle: "Не удалось выгрузить",
@@ -1040,6 +1159,8 @@ function group(strings) {
     alerts: {
       partialTitle: strings.partialTitle,
       partialMessage: strings.partialMessage,
+      unsupportedTitle: strings.unsupportedTitle,
+      unsupportedMessage: strings.unsupportedMessage,
     },
   }
 }

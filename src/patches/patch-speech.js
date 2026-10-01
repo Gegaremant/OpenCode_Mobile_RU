@@ -202,11 +202,17 @@ let session = read(sessionRel)
 session = replaceOnce(
   session,
   "  ActivityIndicator,\n  Alert,\n} from \"react-native\"",
-  "  ActivityIndicator,\n  Alert,\n  Linking,\n  type AlertButton,\n} from \"react-native\"",
+  "  ActivityIndicator,\n  Alert,\n  Linking,\n} from \"react-native\"",
   "react-native imports",
   sessionRel,
 )
 
+// The button list is typed off Alert.alert itself rather than importing the
+// AlertButton type: the v2 client's session screen has no long-press action
+// sheet, and its regression suite asserts that `type AlertButton` appears
+// nowhere in the file (it was unused after the sheet was removed). Importing it
+// here would reintroduce exactly the import that test forbids, and Alert.alert
+// is the same source of truth either way.
 session = replaceOnce(
   session,
   `  useEffect(() => {
@@ -217,7 +223,7 @@ session = replaceOnce(
     if (!speech.error) return
     // Report the real reason instead of a generic string, and when the mic was
     // refused hand the user the only thing left: the OS app-settings toggle.
-    const buttons: AlertButton[] = speech.permissionDenied
+    const buttons: NonNullable<Parameters<typeof Alert.alert>[2]> = speech.permissionDenied
       ? [
           { text: t("common.cancel"), style: "cancel" },
           { text: t("chat.speechErrors.openSettings"), onPress: () => void Linking.openSettings() },

@@ -18,6 +18,11 @@ const path = require("path")
 // Storage is AsyncStorage (not SecureStore): drafts are ordinary user text, and
 // SecureStore is keyed for a handful of credentials — writing every keystroke
 // into the Keystore would be both slow and the wrong store.
+//
+// The session screen is rewritten between client generations, so this patch
+// anchors on the imports it needs (useSpeech/useRef) rather than on anything
+// patch-keyboard.js inserted. patch-keyboard skips the v2 session screen
+// entirely, and depending on its marker would make this patch fail there.
 
 const TARGET = process.argv[2]
 if (!TARGET) {
@@ -183,10 +188,9 @@ let src = read(rel)
 
 src = replaceOnce(
   src,
-  'import { useKeyboardInset } from "../../src/lib/keyboard-inset"',
-  'import { useKeyboardInset } from "../../src/lib/keyboard-inset"\n' +
-    'import { useSessionDraft } from "../../src/lib/session-draft"',
-  "keyboard-inset import",
+  'import { useSpeech } from "../../src/lib/speech"',
+  'import { useSpeech } from "../../src/lib/speech"\nimport { useSessionDraft } from "../../src/lib/session-draft"',
+  "useSpeech import",
   rel,
 )
 
