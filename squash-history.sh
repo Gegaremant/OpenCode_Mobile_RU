@@ -9,6 +9,7 @@
 #   ./squash-history.sh --conflicts            the conflicted files and their markers
 #   ./squash-history.sh --abort                abort an unfinished merge / rebase / cherry-pick
 #   ./squash-history.sh --restore <ref>        go back to a safety tag, hard
+#   ./squash-history.sh --publish <ref>        push HEAD; <ref> is what the rewrite replaced
 #
 # <base> is any revision: a hash (the short form is enough), a tag, or HEAD~3.
 # Everything after it becomes one commit whose tree is exactly what HEAD's tree
@@ -48,6 +49,7 @@ $SELF — fix history, resolve what fixing it leaves behind
   $SELF --conflicts                conflicted files, with their marker lines
   $SELF --abort                    abort an unfinished merge / rebase / cherry-pick
   $SELF --restore <ref>            reset --hard back to a tag or commit
+  $SELF --publish <ref>            push HEAD; <ref> is what the rewrite replaced
 
 Options: -m/--message, --tag, --push, -y/--yes, -n/--dry-run
 USAGE
@@ -82,6 +84,11 @@ while [ $# -gt 0 ]; do
     --status)    MODE="status"; shift ;;
     --conflicts) MODE="conflicts"; shift ;;
     --abort)     MODE="abort"; shift ;;
+    --publish)
+      MODE="publish"
+      [ $# -ge 2 ] || { echo "error: --publish needs the ref the rewrite started from" >&2; exit 1; }
+      BASE="$2"; shift 2 ;;
+    --publish=*) MODE="publish"; BASE="${1#*=}"; shift ;;
     --restore)
       [ $# -ge 2 ] || { echo "error: --restore needs a ref" >&2; exit 1; }
       MODE="restore"; BASE="$2"; shift 2 ;;
@@ -294,6 +301,102 @@ cmd_restore() {
 
 # --------------------------------------------------------------------- --squash --
 
+# Publish the current HEAD over <remote>/<branch> with --force-with-lease,
+# refusing when origin holds a commit this branch does not include.
+#
+# $1 is the commit the rewrite was based on — the pre-rewrite HEAD. It has to be
+# passed explicitly for a separate --publish, because once the rewrite has
+# happened origin/main is genuinely no longer an ancestor of HEAD, so HEAD itself
+# cannot answer "is origin somewhere I left off?". The safety tag from the squash
+# is exactly the right value: it is the commit the rewrite replaced.
+publish_branch() {
+  local rewrite_from="${1:-HEAD}"
+
+  local upstream
+  upstream="$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null || true)"
+  if [ -z "$upstream" ]; then
+    echo "no upstream configured — nothing to push."
+    return 0
+  fi
+
+  # `git push <repo> <branch>` — the upstream is "origin/main", which as a
+  # single argument would name a *repository* called origin/main. Split it.
+  local remote branch remote_sha
+  remote="${upstream%%/*}"
+  branch="${upstream#*/}"
+
+  # Only force-push when everything on origin is already included in what this
+  # branch had before the rewrite.
+  #
+  # The test is ancestry, not equality: our own unpushed commits make
+  # rewrite_from a descendant of origin, which is the normal case and is
+  # perfectly safe. What must not happen is origin holding a commit the rewrite
+  # does not include — that commit would be discarded.
+  #
+  # --force-with-lease cannot do this job. It compares against the remote-tracking
+  # ref, which `git fetch` updates, so someone else's commit that has already been
+  # fetched makes the lease pass and the force-push then throws it away. That is
+  # not hypothetical; it is what the first version of this script did.
+  remote_sha="$(git rev-parse "$remote/$branch")"
+  if ! git merge-base --is-ancestor "$remote_sha" "$rewrite_from"; then
+    local lost
+    lost="$(git rev-list --count "HEAD..$remote_sha")"
+    echo "not pushing: $remote/$branch has $lost commit(s) this rewrite does not"
+    echo "include, and force-pushing would discard them."
+    echo
+    echo "  rewriting from $(git rev-parse --short "$rewrite_from")"
+    echo "  origin has      $(git rev-parse --short "$remote_sha")"
+    if git merge-base --is-ancestor "$rewrite_from" "$remote_sha"; then
+      echo
+      echo "They sit on top of the commit we rewrote — someone pushed after we"
+      echo "did. Take their commits first:"
+      echo "  git rebase $remote/$branch"
+    else
+      echo
+      echo "They are on a different line than ours, not on top of it. This branch"
+      echo "and origin have diverged, and that has to be reconciled by hand before"
+      echo "history can be rewritten at all."
+    fi
+    echo
+    echo "The rewrite itself is intact locally:"
+    echo "  git log --oneline $remote/$branch ^HEAD    what origin has that we do not"
+    echo "  $SELF --restore <ref>                       to undo the rewrite entirely"
+    return 1
+  fi
+
+  echo "pushing $branch to $remote with --force-with-lease…"
+  # Still --force-with-lease, not --force: it closes the window between the check
+  # above and the push actually landing.
+  if git push --force-with-lease "$remote" "$branch"; then
+    echo "pushed."
+  else
+    echo
+    echo "push refused — origin moved between the check and the push."
+    echo "$SELF --status to see how far apart the two are."
+    return 1
+  fi
+}
+
+cmd_publish() {
+  local op
+  op="$(pending_operation)"
+  if [ "$op" != "none" ]; then
+    echo "error: $op is in progress. Finish it ($SELF --abort) first." >&2
+    exit 1
+  fi
+
+  if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
+    echo "error: '$BASE' is not a commit in this repository" >&2
+    exit 1
+  fi
+
+  echo "Publishing HEAD $(git rev-parse --short HEAD), on the authority of"
+  echo "$(git rev-parse --short "$BASE")  $(git log -1 --format='%s' "$BASE")"
+  echo
+  confirm "Proceed?" || { echo "aborted"; exit 1; }
+  publish_branch "$BASE"
+}
+
 cmd_squash() {
   if [ -z "$BASE" ]; then
     usage
@@ -390,76 +493,13 @@ cmd_squash() {
 
   # ------------------------------------------------------------------ publish --
   if [ "$PUSH" -eq 1 ]; then
-    local upstream
-    upstream="$(git rev-parse --abbrev-ref '@{u}' 2>/dev/null || true)"
-    if [ -z "$upstream" ]; then
-      echo
-      echo "no upstream configured — nothing to push."
-      return 0
-    fi
     echo
-    # `git push <repo> <branch>` — the upstream is "origin/main", which as a
-    # single argument would name a *repository* called origin/main. Split it.
-    local remote branch remote_sha
-    remote="${upstream%%/*}"
-    branch="${upstream#*/}"
-
-    # Only force-push when everything on origin is already included in what this
-    # branch had before the rewrite.
-    #
-    # The test is ancestry, not equality: our own unpushed commits make
-    # rewrite_from a descendant of origin, which is the normal case and is
-    # perfectly safe. What must not happen is origin holding a commit the
-    # rewrite does not include — that commit would be discarded.
-    #
-    # --force-with-lease cannot do this job. It compares against the
-    # remote-tracking ref, which `git fetch` updates, so someone else's commit
-    # that has already been fetched makes the lease pass and the force-push then
-    # throws it away. That is not hypothetical; it is what the first version of
-    # this script did.
-    remote_sha="$(git rev-parse "$remote/$branch")"
-    if ! git merge-base --is-ancestor "$remote_sha" "$rewrite_from"; then
-      local lost
-      lost="$(git rev-list --count "HEAD..$remote_sha")"
-      echo "not pushing: $remote/$branch has $lost commit(s) this rewrite does not"
-      echo "include, and force-pushing would discard them."
-      echo
-      echo "  rewriting from $(git rev-parse --short "$rewrite_from")"
-      echo "  origin has      $(git rev-parse --short "$remote_sha")"
-      if git merge-base --is-ancestor "$rewrite_from" "$remote_sha"; then
-        echo
-        echo "They sit on top of the commit we rewrote — someone pushed after we"
-        echo "did. Take their commits first:"
-        echo "  git rebase $remote/$branch"
-      else
-        echo
-        echo "They are on a different line than ours, not on top of it. This branch"
-        echo "and origin have diverged, and that has to be reconciled by hand before"
-        echo "history can be rewritten at all."
-      fi
-      echo
-      echo "The rewrite itself is done and is intact locally:"
-      echo "  git log --oneline $remote/$branch ^HEAD    what origin has that we do not"
-      echo "  $SELF --restore <ref>                       to undo the rewrite entirely"
-      return 1
-    fi
-
-    echo "pushing $branch to $remote with --force-with-lease…"
-    # Still --force-with-lease, not --force: it closes the window between the
-    # check above and the push actually landing.
-    if git push --force-with-lease "$remote" "$branch"; then
-      echo "pushed."
-    else
-      echo
-      echo "push refused — origin moved between the check and the push."
-      echo "$SELF --status to see how far apart the two are."
-      return 1
-    fi
+    publish_branch "$rewrite_from"
   else
     echo
     echo "History rewritten locally. To publish:"
-    echo "  git push --force-with-lease"
-    echo "or re-run the squash with --push to do it in one step."
+    echo "  $SELF --publish"
+    echo "or re-run the squash with --push to do both in one step."
     if [ -n "$SAFETY_TAG" ]; then
       echo "To undo: $SELF --restore $SAFETY_TAG"
     fi
@@ -473,5 +513,6 @@ case "$MODE" in
   conflicts) cmd_conflicts ;;
   abort)     cmd_abort ;;
   restore)   cmd_restore ;;
+  publish)   cmd_publish ;;
   squash)    cmd_squash ;;
 esac
