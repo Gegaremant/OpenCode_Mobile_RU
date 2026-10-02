@@ -119,6 +119,21 @@ export function classifyGeneration(
   health: ProbeAttempt,
   apiInfo: ProbeAttempt,
 ): { classification: Classification; summary: string } | undefined {
+  // Rejected credentials, read on the v2 route. classify() has an auth-failed
+  // branch, but it keys on the *health* probe, and on a v2 server health is a
+  // 200 that says nothing — so the branch never fires and the report calls it a
+  // v2 server with no hint about the password. This is the actual answer in
+  // the common case of "the app cannot connect to my v2 server".
+  if (apiInfo.status === 401 || apiInfo.status === 403) {
+    return {
+      classification: "auth-failed",
+      summary:
+        \`The server rejected your credentials (HTTP \${apiInfo.status} on /api/info). \` +
+        \`The server is an opencode 2.x instance and it is reachable; the password is what is wrong. \` +
+        \`Check the password, and the username if you set OPENCODE_SERVER_USERNAME on the server \` +
+        \`(it defaults to "opencode"). Note that Quick Connect has no username field. \`,
+    }
+  }
   if (served(health) && !isJson(health)) {
     const why =
       served(apiInfo) && isJson(apiInfo)
@@ -234,6 +249,20 @@ diag = replaceOnce(
 
 diag = replaceOnce(diag, `    attempts: [health, root, internet],`, `    attempts: [health, root, internet, apiInfo],`, "attempts list", diagRel)
 
+diag = replaceOnce(
+  diag,
+  `    const status = a.ok ? \`OK \${a.status ?? ""}\`.trim() : \`FAIL \${a.error ?? ""}\`.trim()`,
+  `    // A failed probe used to render as a bare "FAIL": the branch printed
+    // a.error and ignored a.status, which is set whenever the server answered
+    // at all. That one bit separates "wrong password" (401) from "server is not
+    // there" (no status), and the report threw it away — the very question the
+    // report gets pasted to answer. Print whichever we actually have.
+    const detail = a.ok ? a.status : a.error || (a.status != null ? String(a.status) : "")
+    const status = \`\${a.ok ? "OK" : "FAIL"}\${detail ? \` \${detail}\` : ""}\`.trim()`,
+  "probe status rendering",
+  diagRel,
+)
+
 save(diagRel, diag)
 console.log(diagRel + ": /api/info probed, generation checked before the generic verdict")
 
@@ -255,7 +284,10 @@ function probe(over: Partial<ProbeAttempt>): ProbeAttempt {
 // not exist there — while /api/info answered 401 application/json. The report
 // built from the first of those claimed the connection worked.
 test("a 2xx /global/health that is HTML means a v2 server, not a healthy one", () => {
-  const verdict = classifyGeneration(probe(SPA), probe({ ok: false, status: 401, contentType: "application/json" }))
+  // /api/info answers with the SPA rather than 401 — a proxy in front, or a
+  // server whose v2 route set differs. The generation verdict is still the one
+  // that matters: /global/health served a web page.
+  const verdict = classifyGeneration(probe(SPA), probe(SPA))
   assert.equal(verdict?.classification, "v2-api")
   assert.match(verdict?.summary ?? "", /opencode 2\\.x server/)
 })
@@ -286,9 +318,19 @@ test("a JSON /api/info is a healthy v2 server", () => {
   assert.match(verdict?.summary ?? "", /v2 API at \\/api\\/info/)
 })
 
-test("rejected credentials on both routes defer to the auth-failed verdict", () => {
+test("rejected credentials on both routes still resolve to auth-failed", () => {
   const verdict = classifyGeneration(probe({ ok: false, status: 401 }), probe({ ok: false, status: 401 }))
-  assert.equal(verdict, undefined)
+  assert.equal(verdict?.classification, "auth-failed")
+})
+
+test("a 401 on /api/info is reported as bad credentials, not as a v2 server", () => {
+  // Recorded 2026-10-02 against opencode.gegaremant.ru: /global/health 200 HTML
+  // (the SPA) and /api/info 401. That is a reachable v2 server refusing the
+  // password, and the report has to say so rather than leaving the password as
+  // one of several guesses.
+  const verdict = classifyGeneration(probe(SPA), probe({ ok: false, status: 401, contentType: "application/json" }))
+  assert.equal(verdict?.classification, "auth-failed")
+  assert.match(verdict?.summary ?? "", /password is what is wrong/)
 })
 `
 
