@@ -19,3 +19,14 @@ dist/
 *.keystore
 *.jks
 *.apk
+
+# Session exports (backup-session.sh) — local transcripts of conversations,
+# not repository content, and large.
+SESSION-*.md
+SESSION-*.json
+*_session.md
+*_session.yaml
+
+# Python bytecode from scripts/.
+__pycache__/
+*.pyc
