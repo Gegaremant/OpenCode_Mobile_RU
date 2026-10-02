@@ -1,8 +1,25 @@
-name: Sync & Build with Russian Locale
+# ─── DISABLED ──────────────────────────────────────────────────────────────────
+#
+# This workflow no longer runs on its own. The cron trigger that ran it every
+# twelve hours was removed on 2026-10-02, when support for this fork stopped:
+# opencode 2 ships its own installable web interface, which talks to the same
+# server over the same API, so there is nothing left to rebuild on a schedule.
+#
+# Everything below is left in place, deliberately and unmodified. It is the only
+# record of how the released APK was built, and it still works: dispatch it by
+# hand from the Actions tab and it will build. What it will not do is run by
+# itself, or pick up a change in the upstream API without a human deciding to
+# rebuild.
+#
+# If the released client ever stops working against a given opencode server,
+# that is an upstream API change rather than a bug to fix here — the client and
+# the server versions move independently, and the app follows whatever the server
+# speaks. Fixing it means porting this fork to a new API generation, which is
+# the work that support stopping was about declining.
+name: Sync & Build with Russian Locale (manual only)
 
 on:
-  schedule:
-    - cron: "0 */12 * * *"
+  # No schedule. Only a person, choosing to, on the Actions tab.
   workflow_dispatch:
     inputs:
       force:
