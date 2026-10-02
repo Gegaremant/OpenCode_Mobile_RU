@@ -476,5 +476,16 @@ jobs:
         if: steps.check_sync.outputs.already_synced == 'false'
         run: |
           # Keyed on the commit plus the overlay hash, matching check_sync.
-          git tag "synced-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.overlay }}"
-          git push origin "synced-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.overlay }}"
+          #
+          # Idempotent on purpose: `force` rebuilds a commit whose marker is
+          # already on the remote, and a plain `git tag` then dies with
+          # "tag already exists" — which failed the *previous* run's last step
+          # after the APK and the release were already published, marking a
+          # green build red. The tag is a record, not a gate.
+          TAG="synced-${{ steps.source.outputs.sha }}-${{ steps.source.outputs.overlay }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG already on origin — nothing to record"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
